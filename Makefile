@@ -6,7 +6,7 @@ install:
 	uv sync --no-dev
 
 install-dev:
-	uv sync
+	uv sync --extra dev
 
 # ---- Tests ----
 test:
