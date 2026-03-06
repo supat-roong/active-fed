@@ -12,9 +12,11 @@ In many Federated Learning scenarios, standard **FedAvg** works well when client
 1. **High Variance in Updates**: Workers explore different parts of the environment or train on diverse local data. A client stuck in a bad local optimum will send a gradient update that disrupts the global model's progress.
 2. **Sample and Resource Inefficiency**: Training locally requires interacting with environments or crunching local data. Blindly averaging bad weights means the global model regresses, wasting the compute and samples workers just collected.
 
-**The Solution**: Instead of blindly averaging weights, the central aggregator uses a **Target-Environment Probe**. We evaluate each worker's weight update (*ΔW*) directly on the target environment.
-- We only keep updates that actually improve the global model **(Active Weight)**.
-- For clients that *do* improve the model, we collect their successful rollout trajectories and use them to explicitly fine-tune the global model **(Active Data)**.
+**The Solution**: Instead of blindly averaging client weights, the central aggregator performs a **Target-Environment Probe**: evaluating each worker's proposed weight update (*ΔW*) directly in the target environment before accepting it.
+
+Depending on how well the worker's update performs during this probe, the aggregator applies two active learning strategies:
+- **Active Mode: Weight**: We use a 4-Factor Scoring mechanism (which heavily penalizes updates that regress target-environment performance) to compute a weighted FedAvg. Updates that perform poorly are rejected entirely.
+- **Active Mode: Data**: For workers whose updates *do* significantly improve performance in the target environment, we capture the successful trajectories from their evaluation rollouts. We then use Behavioral Cloning (BC) to explicitly fine-tune the aggregated global model on these high-quality, provably successful trajectories.
 
 ---
 
@@ -197,7 +199,7 @@ make run-pipeline
 
 # Open UIs (after port-forward):
 #   Kubeflow: http://localhost:8080
-#   MLflow:   http://localhost:5000
+#   MLflow:   http://localhost:5050
 #   MinIO:    http://localhost:9001
 
 # 3. Fetch K8s MLflow results + generate plots
