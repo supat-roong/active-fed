@@ -4,12 +4,11 @@ Unit tests for the multi-factor scorer (scorer.py).
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 from src.agent.model import ActorCritic
-from src.aggregator.scorer import ClientUpdate, score_clients, ScoredClient
 from src.aggregator.evaluator import EvalResult
+from src.aggregator.scorer import ClientUpdate, ScoredClient, score_clients
 
 
 def _make_client(

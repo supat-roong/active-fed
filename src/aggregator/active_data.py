@@ -26,8 +26,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from src.aggregator.evaluator import EvalTrajectory
 from src.agent.model import ActorCritic
+from src.aggregator.evaluator import EvalTrajectory
 
 log = logging.getLogger(__name__)
 

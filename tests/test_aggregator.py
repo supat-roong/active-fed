@@ -4,12 +4,11 @@ Unit tests for weighted aggregation (aggregator.py).
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 from src.agent.model import ActorCritic
+from src.aggregator.aggregator import AggregationResult, aggregate
 from src.aggregator.scorer import ClientUpdate, ScoredClient
-from src.aggregator.aggregator import aggregate, AggregationResult
 
 
 def _weights(scale: float = 1.0) -> dict[str, torch.Tensor]:
@@ -153,7 +152,8 @@ class TestWeightMode:
 
         result = aggregate(w_global, clients, scored, weight_mode="data_only")
         assert result.weight_mode == "data_only"
-        # Global weights must remain unchanged (active data not triggered since mode=none by default)
+        # Global weights must remain unchanged (active data not triggered since 
+        # mode=none by default)
         for key in w_global:
             assert torch.allclose(
                 result.global_weights[key].float(), w_global[key].float(), atol=1e-5

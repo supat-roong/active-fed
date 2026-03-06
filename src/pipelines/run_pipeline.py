@@ -7,6 +7,7 @@ Reads config/k8s.yaml and submits the Active-FL pipeline to Kubeflow.
 import argparse
 import logging
 import os
+
 import yaml
 from kfp import Client
 
@@ -60,13 +61,14 @@ def main():
     experiment_name = exp.get("name", "active-fl-cartpole")
 
     log.info("=================================================")
-    log.info(f"  Active-FL Pipeline Run")
+    log.info("  Active-FL Pipeline Run")
     log.info(f"  rounds={fl_rounds} | workers={workers} | episodes={episodes}")
     log.info(f"  combinations to run: {len(combos)}")
     log.info(f"  threshold={score_threshold} | kfp_host={args.kfp_host}")
     log.info("=================================================")
 
     import subprocess
+
     from minio import Minio
 
     log.info("[1/3] Setting up MinIO for MLflow...")
@@ -111,7 +113,8 @@ def main():
         active_data_mode = combo.get("active_data_mode", "bc")
 
         log.info(
-            f"  [{i + 1}/{len(combos)}] Submitting: weight_mode={weight_mode}, active_data_mode={active_data_mode}"
+            f"  [{i + 1}/{len(combos)}] Submitting: weight_mode={weight_mode}, "
+            f"active_data_mode={active_data_mode}"
         )
 
         run_name = (

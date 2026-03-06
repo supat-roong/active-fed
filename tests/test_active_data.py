@@ -16,18 +16,16 @@ import pytest
 import torch
 
 from src.agent.model import ActorCritic
-from src.aggregator.evaluator import (
-    EvalTrajectory,
-    EvalResult,
-    evaluate_candidate,
-    _rollout_with_data,
-)
 from src.aggregator.active_data import (
     ActiveDataUpdater,
-    ActiveDataset,
     build_active_dataset,
 )
-
+from src.aggregator.evaluator import (
+    EvalResult,
+    EvalTrajectory,
+    _rollout_with_data,
+    evaluate_candidate,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures

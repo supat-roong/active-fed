@@ -13,7 +13,7 @@ import os
 
 import kfp
 from kfp import dsl
-from kfp.dsl import component, Output, Artifact, Input
+from kfp.dsl import Artifact, Input, Output, component
 
 
 @component(
@@ -38,12 +38,11 @@ def train_workers(
     Render a PyTorchJob manifest from the Jinja2 template and submit it via kubectl.
     Waits for all workers to complete before returning.
     """
+    import os
     import subprocess
     import time
     import urllib.request
-    import os
     import uuid
-    import json
 
     # ---- Install kubectl ----
     kubectl_url = "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
@@ -232,17 +231,16 @@ def score_and_aggregate(
 
     sys.path.insert(0, "/app")
 
-    import json
     import logging
-    import os
+
     import numpy as np
     import torch
     from minio import Minio
 
+    from src.aggregator.aggregator import aggregate
     from src.aggregator.collect import collect_worker_updates, push_global_weights
     from src.aggregator.evaluator import evaluate_all_candidates
     from src.aggregator.scorer import score_clients
-    from src.aggregator.aggregator import aggregate
 
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger(__name__)
@@ -380,12 +378,12 @@ def evaluate_global(
     sys.path.insert(0, "/app")
 
     import io
-    import json
     import logging
-    import numpy as np
-    import mlflow
-    import torch
     import os
+
+    import mlflow
+    import numpy as np
+    import torch
     from minio import Minio
 
     os.environ["MLFLOW_S3_ENDPOINT_URL"] = f"http://{minio_endpoint}"
@@ -394,7 +392,6 @@ def evaluate_global(
     os.environ["MLFLOW_S3_IGNORE_TLS"] = "true"
 
     from src.aggregator.evaluator import _rollout
-    from src.agent.model import ActorCritic
 
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger(__name__)
@@ -425,7 +422,6 @@ def evaluate_global(
     with open(aggregation_report.path) as f:
         report = json.load(f)
 
-    import shutil
 
     # Log to MLflow
     mlflow.set_tracking_uri(mlflow_tracking_uri)
@@ -473,7 +469,8 @@ def evaluate_global(
             f.write(buf.read())
         mlflow.log_artifact("/tmp/global_model.pt", artifact_path=f"global_models/round_{fl_round}")
 
-        # Also log the full aggregation report as an artifact in MLflow to make it easy to download directly
+        # Also log the full aggregation report as an artifact in MLflow to make it 
+        # easy to download directly
         report_path = "/tmp/aggregation_report.json"
         with open(report_path, "w") as f:
             json.dump(report, f, indent=2)

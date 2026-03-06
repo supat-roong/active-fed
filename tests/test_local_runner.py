@@ -1,12 +1,11 @@
 """
 Unit tests for the local_runner.py module.
-These tests use extensive mocking to avoid running actual RL training or Kubernetes jobs, ensuring they execute quickly.
+These tests use extensive mocking to avoid running actual RL training or Kubernetes jobs, ensuring
+they execute quickly.
 """
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest

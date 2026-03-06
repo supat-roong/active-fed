@@ -6,9 +6,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
-from src.tracking.mlflow_logger import log_round_metrics, log_global_model
+from src.tracking.mlflow_logger import log_global_model, log_round_metrics
 
 
 @patch("src.tracking.mlflow_logger.mlflow")

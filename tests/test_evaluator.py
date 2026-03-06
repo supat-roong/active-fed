@@ -6,14 +6,11 @@ Uses a mock gym environment rather than real CartPole to keep tests fast.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-
-import numpy as np
 import pytest
 import torch
 
 from src.agent.model import ActorCritic
-from src.aggregator.evaluator import evaluate_candidate, evaluate_all_candidates, EvalResult
+from src.aggregator.evaluator import EvalResult, evaluate_all_candidates, evaluate_candidate
 
 
 def _fresh_weights() -> dict[str, torch.Tensor]:

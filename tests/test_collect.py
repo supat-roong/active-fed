@@ -4,10 +4,10 @@ Unit tests for the collect.py module.
 
 from __future__ import annotations
 
-import torch
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from src.aggregator.collect import collect_worker_updates
 

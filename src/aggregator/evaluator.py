@@ -75,7 +75,9 @@ def _rollout(
     physics_seed: int,
     episode_seed: int,
 ) -> tuple[float, list[float], list[int]]:
-    """Run `n_episodes` in a fresh env with the given weights. Returns (mean_reward, rewards, steps)."""
+    """Run `n_episodes` in a fresh env with the given weights.
+    Returns (mean_reward, rewards, steps).
+    """
     model = ActorCritic()
     model.load_state_dict(weights)
     model.eval()

@@ -21,23 +21,22 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any
 
 import gymnasium as gym
 import mlflow
 import numpy as np
 import torch
 
-from src.experiment.env_wrapper import RandomizeCartPolePhysics
-
 from src.agent.model import ActorCritic
 from src.agent.ppo_agent import PPOAgent
-from src.aggregator.aggregator import aggregate, WeightMode
 from src.aggregator.active_data import ActiveDataMode
-from src.aggregator.collect import ClientUpdate
+from src.aggregator.aggregator import WeightMode, aggregate
 from src.aggregator.evaluator import evaluate_all_candidates
-from src.aggregator.scorer import score_clients
-from src.aggregator.scorer import ClientUpdate  # re-export for type reference
+from src.aggregator.scorer import (
+    ClientUpdate,  # re-export for type reference
+    score_clients,
+)
+from src.experiment.env_wrapper import RandomizeCartPolePhysics
 
 log = logging.getLogger(__name__)
 
@@ -139,7 +138,9 @@ def _run_worker(
     episode_seed: int,
     device: str = "cpu",
 ) -> tuple[ClientUpdate, float, float]:
-    """Train one PPO worker, run a post-training eval, return (ClientUpdate, eval_mean, eval_std)."""
+    """Train one PPO worker, run a post-training eval.
+    Returns (ClientUpdate, eval_mean, eval_std).
+    """
     # Seed per-worker for reproducibility
     torch.manual_seed(episode_seed)
     np.random.seed(episode_seed % (2**31))
@@ -254,7 +255,8 @@ def run_experiment(config: RunConfig) -> RunResult:
         f"\n{'=' * 60}\n"
         f"  Starting: {config.run_name}\n"
         f"  weight_mode={config.weight_mode} | active_data_mode={config.active_data_mode}\n"
-        f"  rounds={config.fl_rounds} | workers={config.num_workers} | episodes={config.local_episodes}\n"
+        f"  rounds={config.fl_rounds} | workers={config.num_workers} | "
+        f"episodes={config.local_episodes}\n"
         f"{'=' * 60}"
     )
 
@@ -327,7 +329,8 @@ def run_experiment(config: RunConfig) -> RunResult:
                         clients.append(client)
                         own_env_evals[wid] = (own_mean, own_std)
                         log.debug(
-                            f"  Worker {wid} done: train_reward={client.avg_reward:.1f} | own_eval={own_mean:.1f}"
+                            f"  Worker {wid} done: train_reward={client.avg_reward:.1f} | "
+                            f"own_eval={own_mean:.1f}"
                         )
                     except Exception as e:
                         log.error(f"  Worker {wid} failed: {e}")

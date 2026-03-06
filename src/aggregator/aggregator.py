@@ -27,14 +27,13 @@ from typing import Literal
 import numpy as np
 import torch
 
-from src.aggregator.scorer import ClientUpdate, ScoredClient
 from src.aggregator.active_data import (
     ActiveDataMode,
     ActiveDataUpdater,
-    ActiveDataset,
     build_active_dataset,
 )
 from src.aggregator.evaluator import EvalResult
+from src.aggregator.scorer import ClientUpdate, ScoredClient
 
 log = logging.getLogger(__name__)
 
