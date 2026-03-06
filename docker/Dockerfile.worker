@@ -1,0 +1,18 @@
+# ---- Active-FL Worker Image ----
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install uv
+RUN pip install --no-cache-dir uv
+
+# Copy project files
+COPY pyproject.toml uv.lock* ./
+COPY src/ ./src/
+
+# Install dependencies without global wheel cache to drastically strip down image size
+ENV UV_NO_CACHE=1
+RUN uv sync --no-dev
+
+# Entrypoint: overridden by PyTorchJob command, but useful for local testing
+CMD ["uv", "run", "python", "-m", "src.agent.train_worker", "--help"]

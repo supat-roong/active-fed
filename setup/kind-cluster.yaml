@@ -1,0 +1,25 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: active-fed
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 30080   # Kubeflow Pipelines UI
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 30500   # MLflow UI
+        hostPort: 5050
+        protocol: TCP
+      - containerPort: 30900   # MinIO API
+        hostPort: 9000
+        protocol: TCP
+      - containerPort: 30901   # MinIO Console
+        hostPort: 9001
+        protocol: TCP
+  - role: worker

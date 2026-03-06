@@ -1,0 +1,18 @@
+# ---- Active-FL Aggregator Image ----
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install uv
+RUN pip install --no-cache-dir uv
+
+# Copy project files
+COPY pyproject.toml uv.lock* ./
+COPY src/ ./src/
+
+# Install dependencies (no dev extras)
+RUN uv sync --no-dev && uv pip install pip
+ENV PATH="/app/.venv/bin:$PATH"
+
+# Default: not meant to run standalone; invoked by Kubeflow pipeline component
+CMD ["python", "-c", "print('aggregator image ready')"]

@@ -1,0 +1,65 @@
+# Active-FL Experiment Configuration
+# =====================================
+# All parameters for running and comparing FL experiments.
+# Use `python experiments/run_experiments.py` to execute.
+
+experiment:
+  name: active-fl-comparison
+  output_dir: results/exp9          # where JSON results are saved
+  seed: 42                     # global RNG seed
+
+# --- FL Training Params ---
+training:
+  fl_rounds: 250               # number of federation rounds per experiment
+  num_workers: 5               # parallel PPO workers
+  local_episodes: 50           # episodes each worker trains per round
+  eval_episodes: 20            # CartPole episodes for target-env evaluation probe
+  env_id: CartPole-v1
+
+# --- Aggregation Params ---
+aggregation:
+  score_threshold: 0.0         # min improvement to accept a client weight
+  score_temperature: 1.0       # softmax temperature for active weight
+  active_data_threshold: 0.0   # min improvement to include trajectory in active data
+  active_data_steps: 3         # BC fine-tuning epochs per round
+  active_data_lr: 0.0001
+
+# --- Combinations to Run ---
+# Add or remove entries here to control exactly which experiments run.
+# Use --mode single --weight-mode X --active-data-mode Y for a one-off run.
+#
+# weight_mode choices:
+#   active    — scored softmax FedAvg (importance-weighted)
+#   fedavg    — plain equal-weight FedAvg (vanilla FL baseline)
+#   data_only — skip weight averaging; only Active Data updates the model
+#
+# active_data_mode choices:
+#   none — no trajectory fine-tuning
+#   bc   — behavioral cloning on high-value probe trajectories
+#
+# Nonsensical combos (excluded):
+#   fedavg + bc  (fedavg is a pure baseline, mixing in active data changes what it tests)
+#   data_only + none (nothing would update the model)
+combinations:
+  # - weight_mode: fedavg       # vanilla FL baseline
+  #   active_data_mode: none
+
+  # - weight_mode: active       # Active Weight only
+  #   active_data_mode: none
+
+  # - weight_mode: data_only    # pure Active Data: BC
+  #   active_data_mode: bc
+
+  - weight_mode: active       # Active Weight + BC
+    active_data_mode: bc
+
+# --- Visualization ---
+visualization:
+  output_dir: results/plots
+  solved_threshold: 195.0      # CartPole "solved" reward
+  show_std: true               # show +/- std band on learning curves
+  figure_dpi: 150
+  color_palette:               # one color per weight_mode
+    active: "#4C72B0"
+    fedavg: "#DD8452"
+    data_only: "#55A868"
