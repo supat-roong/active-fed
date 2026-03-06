@@ -38,7 +38,6 @@ def train_workers(
     Render a PyTorchJob manifest from the Jinja2 template and submit it via kubectl.
     Waits for all workers to complete before returning.
     """
-    import json
     import os
     import subprocess
     import time
@@ -232,7 +231,6 @@ def score_and_aggregate(
 
     sys.path.insert(0, "/app")
 
-    import json
     import logging
 
     import numpy as np
