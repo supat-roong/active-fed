@@ -54,21 +54,27 @@ graph TD
         ProbeN[Eval W_global + ΔW_N]:::probe
         
         Score[4-Factor Scoring]:::agg
-        AW[Active Weight: Softmax FedAvg]:::agg
-        AD[Active Data: BC Fine-tune]:::agg
+        
+        subgraph Phase 1: Active Weight
+            AW[Weighted FedAvg]:::agg
+        end
+        
+        subgraph Phase 2: Active Data
+            AD[BC Fine-Tuning]:::agg
+        end
     end
     
     W1 -->|ΔW_1| Probe1
     W2 -->|ΔW_2| Probe2
     WN -->|ΔW_N| ProbeN
     
-    Probe1 -->|Improvement Score & Trajectories| Score
-    Probe2 -->|Improvement Score & Trajectories| Score
-    ProbeN -->|Improvement Score & Trajectories| Score
+    Probe1 -->|Scores & Trajectories| Score
+    Probe2 -->|Scores & Trajectories| Score
+    ProbeN -->|Scores & Trajectories| Score
     
-    Score --> AW
-    Score --> AD
-    AW --> AD
+    Score -->|Accepted Weights & Scores| AW
+    Score -->|High-value Trajectories| AD
+    AW -->|Aggregated Model| AD
     AD -->|New Global Model| NextRound[Next FL Round]
 ```
 
