@@ -258,3 +258,7 @@ make local-teardown   destroy kind cluster
 make clean            remove __pycache__
 make clean-results    remove results/ directory
 ```
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
