@@ -152,7 +152,7 @@ class TestWeightMode:
 
         result = aggregate(w_global, clients, scored, weight_mode="data_only")
         assert result.weight_mode == "data_only"
-        # Global weights must remain unchanged (active data not triggered since 
+        # Global weights must remain unchanged (active data not triggered since
         # mode=none by default)
         for key in w_global:
             assert torch.allclose(

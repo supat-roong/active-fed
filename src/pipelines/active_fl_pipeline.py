@@ -423,7 +423,6 @@ def evaluate_global(
     with open(aggregation_report.path) as f:
         report = json.load(f)
 
-
     # Log to MLflow
     mlflow.set_tracking_uri(mlflow_tracking_uri)
     mlflow.set_experiment(mlflow_experiment_name)
@@ -470,7 +469,7 @@ def evaluate_global(
             f.write(buf.read())
         mlflow.log_artifact("/tmp/global_model.pt", artifact_path=f"global_models/round_{fl_round}")
 
-        # Also log the full aggregation report as an artifact in MLflow to make it 
+        # Also log the full aggregation report as an artifact in MLflow to make it
         # easy to download directly
         report_path = "/tmp/aggregation_report.json"
         with open(report_path, "w") as f:
