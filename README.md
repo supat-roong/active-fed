@@ -116,7 +116,7 @@ All 4 mode combinations run in parallel subprocesses via `ProcessPoolExecutor`. 
 # Install
 make install-dev
 
-# Run tests (46 unit tests)
+# Run tests
 make test
 
 # Run all combinations from config/local.yaml (parallel, auto-plots)
@@ -229,7 +229,8 @@ analysis/
 k8s/              Manifests: MinIO, MLflow, RBAC, PyTorchJob template
 docker/           Worker + aggregator Dockerfiles
 setup/            kind cluster bootstrap + teardown scripts
-tests/            Unit tests (46 tests across all components)
+run_pipeline.sh   Kubeflow pipeline trigger script
+tests/            Unit tests across all components
 results/          Local experiment outputs (JSON + plots)
 mlruns/           Local MLflow tracking store
 ```
@@ -238,8 +239,8 @@ mlruns/           Local MLflow tracking store
 
 ```
 make install          install prod deps (uv sync --no-dev)
-make install-dev      install all deps including dev (uv sync)
-make test             run 46 unit tests
+make install-dev      install all deps including dev (uv sync --extra dev)
+make test             run unit tests
 make test-fast        run tests, skipping slow training tests
 make lint             ruff check src/ tests/
 make fmt              ruff format src/ tests/
@@ -251,6 +252,7 @@ make mlflow-ui        launch MLflow UI against ./mlruns (http://localhost:5000)
 make compare          regenerate plots from results/
 make compare-k8s      fetch remote MLflow results + regenerate plots
 make compile-pipeline compile Kubeflow pipeline → /tmp/active_fl_pipeline.yaml
+make run-pipeline     trigger the compiled pipeline locally
 make build-images     build Docker images
 make load-images      load into kind cluster
 make local-setup      bootstrap kind cluster
