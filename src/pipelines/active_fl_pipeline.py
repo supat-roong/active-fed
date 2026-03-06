@@ -232,6 +232,7 @@ def score_and_aggregate(
 
     sys.path.insert(0, "/app")
 
+    import json
     import logging
 
     import numpy as np
