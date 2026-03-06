@@ -152,6 +152,8 @@ Outputs saved to `results/`:
 - `results/plots/acceptance_rate.png`
 - `results/plots/active_data_usage.png`
 - `results/plots/client_improvements.png`
+- `results/plots/worker_own_env_curves.png`
+- `results/plots/worker_target_env_curves.png`
 
 **Configure in `config/local.yaml`** — edit `combinations:`, training rounds, workers, etc.
 
