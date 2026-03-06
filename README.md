@@ -1,8 +1,8 @@
-# Active-Federated Learning on CartPole
+# Active-Federated Learning
 
-> **Disclaimer**: This is a personal exploration project, not a formal research paper or production framework.
+**Federated Learning with active learning**: This project explores combining active learning strategies with federated learning. Instead of naive Federated Averaging (FedAvg), the central server evaluates and selects updates using **Active Weight** and **Active Data** methods to improve the global model.
 
-> **Federated Learning with active learning** — Distributed workers train in parallel, but instead of naive FedAvg, two active learning strategies select and improve the global model each round based on target-environment evaluation probes.
+The framework supports running experiments both **locally** (via parallel subprocesses) and remotely on **Kubernetes** (via Kubeflow Pipelines and PyTorchJobs).
 
 ---
 
@@ -286,6 +286,10 @@ make local-teardown   destroy kind cluster
 make clean            remove __pycache__
 make clean-results    remove results/ directory
 ```
+
+## Disclaimer
+
+This is a personal exploration project, not a formal research paper or production framework.
 
 ## License
 
