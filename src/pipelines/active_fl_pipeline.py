@@ -38,6 +38,7 @@ def train_workers(
     Render a PyTorchJob manifest from the Jinja2 template and submit it via kubectl.
     Waits for all workers to complete before returning.
     """
+    import json
     import os
     import subprocess
     import time
