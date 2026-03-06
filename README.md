@@ -192,15 +192,6 @@ graph TD
 - **Pod logs**: per-worker training progress, client scores, improvement values
 - **Artifacts**: aggregation report JSON (accepted/rejected clients with scores)
 
-### What to see in MLflow UI
-Each round logs:
-- `global_eval_reward_mean` / `_std`
-- `clients_accepted` / `clients_rejected`
-- `effective_weight_norm`
-- `active_data_applied`, `active_data_n_steps`
-- `client_<id>_score`, `client_<id>_improvement`
-- Global model checkpoint artifact in `global_models/round_N/`
-
 ```bash
 # Prerequisites: kind, kubectl, helm, docker
 
@@ -221,6 +212,24 @@ make compare-k8s
 # 4. Teardown
 make local-teardown
 ```
+
+---
+
+
+## What to see in MLflow (Local & K8s)
+
+Because both the local runner (`Use Case 1`) and the pipeline (`Use Case 2`) use the exact same MLflow tracking logic, you will see the exact same metrics and artifacts tracked over time in the MLflow UI (regardless of whether it's running locally in `./mlruns` or remotely in Kubernetes).
+
+Each round logs:
+- `global_eval_reward_mean` / `_std` / `solved`
+- `clients_accepted` / `clients_rejected`
+- `effective_weight_norm`
+- `active_data_applied` / `active_data_n_steps` / `num_active_data_sources`
+- `client_<id>_score` / `client_<id>_improvement` / `client_<id>_accepted`
+- `client_<id>_own_env_reward_mean`
+- `client_<id>_target_env_reward_mean` / `_std`
+- Global model checkpoint artifact in `global_models/round_N/`
+- Aggregation JSON report artifact in `reports/round_N/`
 
 ---
 
