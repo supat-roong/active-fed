@@ -165,13 +165,26 @@ Workers run as isolated pods (true process separation), weights and artifacts fl
 
 ### What runs in K8s
 
-```
-Kubeflow Pipeline DAG (per FL round):
-  train_workers          → PyTorchJob: N worker pods train PPO in parallel
-       ↓
-  score_and_aggregate    → Aggregator pod: eval probes, scoring, FedAvg + active data
-       ↓                   Reads/writes weights to MinIO
-  evaluate_global        → Evaluation pod: global model eval, logs all metrics to MLflow
+```mermaid
+graph TD
+    classDef job fill:#e3f2fd,stroke:#1565c0
+    classDef pod fill:#f3e5f5,stroke:#6a1b9a
+    classDef store fill:#fff3e0,stroke:#e65100
+    
+    Train[train_workers<br><i>PyTorchJob: N worker pods train PPO</i>]:::job
+    Agg[score_and_aggregate<br><i>Aggregator pod: eval probes, scoring, FedAvg + active data</i>]:::pod
+    Eval[evaluate_global<br><i>Evaluation pod: global model eval</i>]:::pod
+    
+    MinIO[(MinIO Storage)]:::store
+    MLflow[(MLflow Server)]:::store
+    
+    Train -->|Δw_i| MinIO
+    Train --> Agg
+    MinIO -->|Fetch Δw_i| Agg
+    Agg -->|Write W_new| MinIO
+    Agg --> Eval
+    MinIO -->|Fetch W_new| Eval
+    Eval -->|Log Metrics & Checkpoints| MLflow
 ```
 
 ### What to see in Kubeflow UI
