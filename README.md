@@ -54,12 +54,13 @@ graph TD
         ProbeN[Eval W_global + ΔW_N]:::probe
         
         Score[4-Factor Scoring]:::agg
+        Target[Target-Env Tracking]:::agg
         
-        subgraph Phase 1: Active Weight
+        subgraph Active Mode: Weight
             AW[Weighted FedAvg]:::agg
         end
         
-        subgraph Phase 2: Active Data
+        subgraph Active Mode: Data
             AD[BC Fine-Tuning]:::agg
         end
     end
@@ -68,12 +69,16 @@ graph TD
     W2 -->|ΔW_2| Probe2
     WN -->|ΔW_N| ProbeN
     
-    Probe1 -->|Scores & Trajectories| Score
-    Probe2 -->|Scores & Trajectories| Score
-    ProbeN -->|Scores & Trajectories| Score
+    Probe1 -->|Rewards| Target
+    Probe2 -->|Rewards| Target
+    ProbeN -->|Rewards| Target
+
+    Probe1 -->|Trajectories & Gradients| Score
+    Probe2 -->|Trajectories & Gradients| Score
+    ProbeN -->|Trajectories & Gradients| Score
     
     Score -->|Accepted Weights & Scores| AW
-    Score -->|High-value Trajectories| AD
+    Target -->|High-value Trajectories| AD
     AW -->|Aggregated Model| AD
     AD -->|New Global Model| NextRound[Next FL Round]
 ```
