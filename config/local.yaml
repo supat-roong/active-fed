@@ -5,7 +5,7 @@
 
 experiment:
   name: active-fl-comparison
-  output_dir: results/exp9          # where JSON results are saved
+  output_dir: results          # where JSON results are saved
   seed: 42                     # global RNG seed
 
 # --- FL Training Params ---
@@ -41,14 +41,14 @@ aggregation:
 #   fedavg + bc  (fedavg is a pure baseline, mixing in active data changes what it tests)
 #   data_only + none (nothing would update the model)
 combinations:
-  # - weight_mode: fedavg       # vanilla FL baseline
-  #   active_data_mode: none
+  - weight_mode: fedavg       # vanilla FL baseline
+    active_data_mode: none
 
-  # - weight_mode: active       # Active Weight only
-  #   active_data_mode: none
+  - weight_mode: active       # Active Weight only
+    active_data_mode: none
 
-  # - weight_mode: data_only    # pure Active Data: BC
-  #   active_data_mode: bc
+  - weight_mode: data_only    # pure Active Data: BC
+    active_data_mode: bc
 
   - weight_mode: active       # Active Weight + BC
     active_data_mode: bc
