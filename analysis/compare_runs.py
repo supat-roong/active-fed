@@ -23,13 +23,12 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any
 
 import matplotlib
 
 matplotlib.use("Agg")  # non-interactive backend
-import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -410,7 +409,10 @@ def plot_active_data_usage(
             rd["active_data_n_steps"] if rd["active_data_applied"] else 0 for rd in rounds_data
         ]
         color = colors.get(r["weight_mode"], "#888888")
-        ax.bar(xs, steps, color=color, alpha=0.85, edgecolor="white")
+        import matplotlib.colors as mcolors
+        dark_color = tuple(c * 0.6 for c in mcolors.to_rgb(color))
+        
+        ax.bar(xs, steps, color=dark_color, alpha=1.0, edgecolor="none", width=1.0)
         ax.set_title(_label(r), fontsize=9)
         ax.set_xlabel("Round")
         ax.grid(True, axis="y", alpha=0.3)

@@ -257,7 +257,7 @@ docker/           Worker + aggregator Dockerfiles
 setup/            kind cluster bootstrap + teardown scripts
 run_pipeline.sh   Kubeflow pipeline trigger script
 tests/            Unit tests across all components
-results/          Local experiment outputs (JSON + plots)
+results/          Experiment outputs (JSON + plots)
 mlruns/           Local MLflow tracking store
 ```
 
