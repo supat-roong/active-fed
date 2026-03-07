@@ -440,8 +440,11 @@ def plot_client_improvements(
 ) -> None:
     colors = colors or DEFAULT_COLORS
     n = len(results)
-    ncols = min(3, n)
-    nrows = (n + ncols - 1) // ncols
+    if n == 4:
+        ncols, nrows = 2, 2
+    else:
+        ncols = min(3, n)
+        nrows = (n + ncols - 1) // ncols
     fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.5, nrows * 3.8), squeeze=False)
 
     client_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
@@ -508,8 +511,11 @@ def plot_worker_metric_curves(
     """
     colors = colors or DEFAULT_COLORS
     n = len(results)
-    ncols = min(3, n)
-    nrows = (n + ncols - 1) // ncols
+    if n == 4:
+        ncols, nrows = 2, 2
+    else:
+        ncols = min(3, n)
+        nrows = (n + ncols - 1) // ncols
     fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.5, nrows * 3.8), squeeze=False)
 
     client_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
