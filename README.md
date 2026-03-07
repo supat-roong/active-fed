@@ -24,17 +24,18 @@ Depending on how well the worker's update performs during this probe, the aggreg
 
 Running all active learning combinations locally (`make run-experiments`) generates these comparison plots automatically:
 
-### 1. Faster Convergence (Learning Curves)
-*Active data paths (Green/Red/Purple) reach the solved threshold much faster and with lower variance than the FedAvg baseline (Orange).*
+### 1. Global Learning Curves
+- **Behavioral Cloning (Data Only)**: Learns extremely fast early on, but is limited by the pure BC approach and fails to adapt or generalize to the environment, preventing it from achieving high final rewards.
+- **FedAvg**: Suffers from catastrophic forgetting as local worker updates diverge, leading to a massive drop in performance midway through training.
+- **Active FL**: Active methods learn steadily across all rounds. Combining **Active Weight + Active Data (BC)** dramatically accelerates learning with a much steeper curve and achieves the highest peak performance.
+
 ![Learning Curves](results/plots/learning_curves.png)
 
-### 2. Final Performance (Heatmap)
-*Using Active Data (BC) strictly dominates having no active data. Combining both Active Weight + Active Data yields the highest, most stable final rewards.*
-![Heatmap Analysis](results/plots/heatmap.png)
+### 2. Worker Own-Environment Performance
+- **Active Stability & Independence**: Active methods perform better globally and yield higher improvements, even if individual worker rewards in their own environments aren't as extremely high. The global model is stabilized without being strictly bound to the immediate whims of any one worker.
+- **FedAvg Entanglement**: In contrast, the FedAvg baseline global reward (solid line) stays very close to the individual worker rewards, struggling with high variance and catastrophic forgetting as divergent local updates constantly overwrite each other.
 
-### 3. Fine-Tuning Efficiency (Active Data Usage)
-*Fine-tuning only fires when a client proves it has found a better policy. Notice how usage drops off once the environment is solved.*
-![Active Data Usage](results/plots/active_data_usage.png)
+![Worker Own-Environment Curves](results/plots/worker_own_env_curves.png)
 
 ---
 
