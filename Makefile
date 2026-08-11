@@ -27,9 +27,11 @@ type-check:
 
 # ---- Local k8s ----
 local-setup:
+	git submodule update --init --recursive
 	bash setup/install_local.sh
 
 local-teardown:
+	git submodule update --init --recursive
 	bash setup/teardown_local.sh
 
 # ---- Docker ----

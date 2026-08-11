@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# teardown_local.sh — Destroys the local kind cluster and cleans up port-forwards
-
+# teardown_local.sh — destroy the local cluster via vendor/fed-infra.
 set -euo pipefail
 
-echo "Tearing down kind cluster 'active-fed'..."
-pkill -f "kubectl port-forward" 2>/dev/null || true
-kind delete cluster --name active-fed
-echo "✅ Cluster deleted."
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+"${ROOT_DIR}/vendor/fed-infra/bin/fed-infra-down" --env "${ROOT_DIR}/infra.env"
