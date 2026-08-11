@@ -198,6 +198,11 @@ graph TD
 ```bash
 # Prerequisites: kind, kubectl, helm, docker
 
+# 0. Initialize the vendor/fed-infra submodule (first checkout, or after a pull
+#    that bumped it) — `make local-setup` also does this, but it's cheap to run
+#    explicitly and is required before invoking vendor/fed-infra scripts directly.
+git submodule update --init --recursive
+
 # 1. Bootstrap local kind cluster (MinIO, MLflow, Kubeflow)
 make local-setup
 
