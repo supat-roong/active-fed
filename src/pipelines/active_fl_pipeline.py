@@ -25,6 +25,43 @@ import kfp
 from kfp import dsl
 from kfp.dsl import Artifact, Input, Output, component
 
+# ---------------------------------------------------------------------------
+# CLI argument parsing
+# ---------------------------------------------------------------------------
+# This has to run here, before `active_fl_pipeline` is defined below, and NOT
+# in the "Compile" block at the bottom of this file where a `--rounds`/
+# `--start-round` override would look like it belongs. `@dsl.pipeline` (used
+# on `active_fl_pipeline` below) traces that function's body immediately when
+# it decorates it -- i.e. the moment Python executes that `def` statement --
+# not later when `Compiler().compile()` is called (confirmed against the
+# installed kfp: `GraphComponent.__init__` calls `pipeline_func(*args_list)`
+# synchronously in its own constructor; `Compiler.compile()` only reads back
+# the already-built `pipeline_spec`, it never re-invokes the function). Env
+# vars set after that definition -- e.g. in a single `if __name__` block at
+# the bottom of the file, as this used to be structured -- are silently too
+# late: the DAG shape is already frozen, so neither flag would have any
+# effect on the compiled output despite compiling without error.
+if __name__ == "__main__":
+    import argparse
+
+    _parser = argparse.ArgumentParser()
+    _parser.add_argument("--output", default="active_fl_pipeline.yaml")
+    _parser.add_argument(
+        "--rounds", type=int, default=None, help="Force override of compile-time fl_rounds"
+    )
+    _parser.add_argument(
+        "--start-round",
+        type=int,
+        default=None,
+        help="Force override of compile-time start_round (resume point)",
+    )
+    args = _parser.parse_args()
+
+    if args.rounds is not None:
+        os.environ["FL_ROUNDS"] = str(args.rounds)
+    if args.start_round is not None:
+        os.environ["START_ROUND"] = str(args.start_round)
+
 
 # ---------------------------------------------------------------------------
 # Component: Init Global Model
@@ -506,9 +543,6 @@ def active_fl_pipeline(
     # config/k8s.yaml's experiment.seed by run_pipeline.py; the default here
     # only applies to direct compilation (`make compile-pipeline`).
     seed: int = 42,
-    # Round to resume from -- see the start_round handling below for why this
-    # cannot simply be read inside the loop like a normal component argument.
-    start_round: int = 0,
 ) -> None:
     """Full active-FL pipeline (Active Weight + Active Data) over fl_rounds sequential rounds."""
 
@@ -516,6 +550,22 @@ def active_fl_pipeline(
     # so we chain rounds explicitly. For production with many rounds,
     # use the pipeline as a single-round step and submit it repeatedly.
     # Here we unroll for clarity (up to fl_rounds via recursive chaining).
+    #
+    # fl_rounds and start_round are deliberately NOT dsl parameters. KFP v2
+    # traces this function exactly once, substituting a
+    # PipelineParameterChannel placeholder for every declared dsl parameter --
+    # never the literal default or a submitted value (confirmed empirically:
+    # using such a parameter as a `range()` bound raises "TypeError:
+    # 'PipelineParameterChannel' object cannot be interpreted as an integer").
+    # A dsl parameter therefore cannot change how many train_workers tasks
+    # exist; that shape is frozen at trace time. This is exactly the trap a
+    # `start_round` dsl parameter used to set (P2 review Finding 1): it
+    # showed up in the KFP UI/API as if it worked, but silently had zero
+    # effect on which rounds execute. Both round counts below are instead
+    # resolved from the environment ahead of the trace -- see the first
+    # `if __name__ == "__main__":` block near the top of this file for why
+    # that must happen *before* this function is defined, not merely before
+    # `Compiler().compile()` is called.
 
     import yaml
 
@@ -526,20 +576,9 @@ def active_fl_pipeline(
     except Exception:
         compile_time_rounds = int(os.environ.get("FL_ROUNDS", "5"))
 
-    # `start_round` above is a genuine pipeline parameter (so it shows up on
-    # every KFP run for inspection/audit), but it CANNOT be used as the bound
-    # of this Python `range()`: during compilation KFP traces this function
-    # with a PipelineParameterChannel placeholder standing in for every
-    # declared parameter, never the literal default or a submitted value --
-    # confirmed empirically (`range(start_round, ...)` raises "TypeError:
-    # 'PipelineParameterChannel' object cannot be interpreted as an integer"
-    # the moment this module is compiled). KFP v2 has no native dynamic-loop
-    # support, which is exactly why `compile_time_rounds` above is already
-    # sourced from the config file / FL_ROUNDS env var instead of a dsl
-    # parameter. `start_round` gets the same treatment: the round actually
-    # skipped is resolved here, at compile time, from the START_ROUND env var
-    # (run_pipeline.py sets this from `compute_start_round` before invoking
-    # the compiler, once it knows which bucket -- if any -- is being resumed).
+    # Resolved from the START_ROUND env var: run_pipeline.py computes this
+    # from `compute_start_round` (which round to resume from, if any) and
+    # passes it as a --start-round CLI flag to this module's __main__ block.
     compile_time_start_round = int(os.environ.get("START_ROUND", "0"))
 
     # init_global_model is idempotent -- it leaves an existing round_0/global.pt
@@ -614,27 +653,10 @@ def active_fl_pipeline(
 # ---------------------------------------------------------------------------
 # Compile
 # ---------------------------------------------------------------------------
+# `args` (and the FL_ROUNDS/START_ROUND env vars) were already set by the
+# `if __name__ == "__main__":` block at the top of this file, before
+# `active_fl_pipeline` was defined -- see the comment there.
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--output", default="active_fl_pipeline.yaml")
-    parser.add_argument(
-        "--rounds", type=int, default=None, help="Force override of compile-time fl_rounds"
-    )
-    parser.add_argument(
-        "--start-round",
-        type=int,
-        default=None,
-        help="Force override of compile-time start_round (resume point)",
-    )
-    args = parser.parse_args()
-
-    if args.rounds is not None:
-        os.environ["FL_ROUNDS"] = str(args.rounds)
-    if args.start_round is not None:
-        os.environ["START_ROUND"] = str(args.start_round)
-
     kfp.compiler.Compiler().compile(
         pipeline_func=active_fl_pipeline,
         package_path=args.output,

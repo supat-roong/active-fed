@@ -225,12 +225,14 @@ def main():
             "temporal_address": temporal_address,
             "run_uid": run_uid,
             "seed": seed,
-            # Informational only: the compiled pipeline's DAG shape already
-            # baked in this start_round (see active_fl_pipeline.py's
-            # START_ROUND handling), so this cannot change behavior after the
-            # fact -- it is recorded here so the KFP run's arguments show what
-            # was actually compiled in.
-            "start_round": start_round,
+            # P2 review fix wave, Finding 1: start_round is NOT passed here.
+            # It was previously recorded as a run argument even though it is
+            # not a dsl parameter the pipeline reads -- a KFP run argument
+            # with no corresponding declared parameter is exactly the silent
+            # trap that finding was about. The compiled pipeline's DAG shape
+            # already baked in `start_round` (see the --start-round CLI flag
+            # passed to the compile step above, and active_fl_pipeline.py's
+            # START_ROUND handling); it is logged there, not resubmitted here.
         }
 
         run = client.create_run_from_pipeline_package(
