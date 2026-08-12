@@ -72,6 +72,12 @@ mlflow-ui:
 	uv run mlflow ui --backend-store-uri ./mlruns
 # Open http://localhost:5000 to view experiment results
 
+temporal-ui:
+	@echo "Temporal UI → http://localhost:8233"
+
+run-temporal-worker:
+	uv run python -m src.orchestration.worker_main
+
 compare:
 	uv run python analysis/compare_runs.py
 # Output: results/plots/*.png
