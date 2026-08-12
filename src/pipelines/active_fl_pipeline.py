@@ -59,7 +59,7 @@ def train_workers(
             "restore it from git history if you need it"
         )
 
-    from temporalio.client import Client
+    from temporalio.client import Client, WorkflowFailureError
     from temporalio.common import WorkflowIDConflictPolicy
 
     from src.orchestration.types import RoundSpec
@@ -97,7 +97,32 @@ def train_workers(
             id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
         )
         print(f"started Temporal workflow {handle.id}")
-        report = await handle.result()
+        try:
+            report = await handle.result()
+        except WorkflowFailureError as e:
+            # I2 (final review): quorum wasn't met, so TrainRoundWorkflow raised
+            # instead of returning its RoundReport -- the full report was built
+            # and then discarded. Queries still work against a closed workflow,
+            # so the per-worker status the workflow already tracked survives
+            # here even though the return value didn't. Recovering it is the
+            # difference between "one exception line and no artifact" and the
+            # per-worker attribution this whole component exists to provide.
+            # The round must still fail -- re-raise after writing the artifact.
+            statuses = await handle.query(TrainRoundWorkflow.status)
+            payload = {
+                "fl_round": fl_round,
+                "succeeded": sorted(
+                    wid for wid, s in statuses.items() if s.phase == "Succeeded"
+                ),
+                "failed": sorted(wid for wid, s in statuses.items() if s.phase != "Succeeded"),
+                "results": [vars(statuses[wid]) for wid in sorted(statuses)],
+                "temporal_workflow_id": handle.id,
+                "error": str(e),
+            }
+            print(json.dumps(payload, indent=2))
+            with open(worker_report.path, "w") as f:
+                json.dump(payload, f, indent=2)
+            raise
         return {
             "fl_round": report.fl_round,
             "succeeded": report.succeeded_ids,
