@@ -1,10 +1,13 @@
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
+import src.orchestration.activities as activities_module
+from src.orchestration.activities import cleanup_worker_job, launch_and_watch_pod
 from src.orchestration.types import RoundSpec, WorkerResult, WorkerSpec
 from src.orchestration.workflows import TASK_QUEUE, TrainRoundWorkflow, WorkerWorkflow
 
@@ -255,3 +258,111 @@ async def test_gather_exception_reports_root_cause_not_generic_wrapper():
     failed = next(r for r in report.results if r.worker_id == 1)
     assert "OOMKilled" in failed.failure_reason
     assert failed.failure_reason != "Child Workflow execution failed"
+
+
+# ---------------------------------------------------------------------------
+# I1 consequence check: with launch_and_watch_pod now raising on a genuine Job
+# failure (rather than returning WorkerResult(succeeded=False, ...)), confirm
+# end-to-end -- through the *real* activity, not a hand-rolled fake -- that
+# asyncio.gather(..., return_exceptions=True) still turns the exhausted-retry
+# exception into a useful synthetic WorkerResult, that the C1 log tail
+# survives all the way into RoundReport.failure_reason, and that quorum
+# tolerance for the surviving workers is unaffected.
+# ---------------------------------------------------------------------------
+class _MixedBatchApi:
+    """Fails only the Job whose deterministic name ends in the given worker
+    suffix; every other worker's Job succeeds immediately. Job names are
+    unique per worker (job_name_for), so the suffix check is enough to steer
+    the *real* launch_and_watch_pod per-worker without a hand-rolled fake."""
+
+    def __init__(self, failing_suffix: str):
+        self._failing_suffix = failing_suffix
+
+    def create_namespaced_job(self, namespace, body):
+        pass
+
+    def read_namespaced_job_status(self, name, namespace):
+        if name.endswith(self._failing_suffix):
+            return SimpleNamespace(
+                status=SimpleNamespace(
+                    conditions=[SimpleNamespace(type="Failed", status="True")],
+                    succeeded=None, failed=1,
+                )
+            )
+        return SimpleNamespace(
+            status=SimpleNamespace(
+                conditions=[SimpleNamespace(type="Complete", status="True")],
+                succeeded=1, failed=None,
+            )
+        )
+
+    def delete_namespaced_job(self, name, namespace, propagation_policy):
+        pass
+
+
+class _MixedCoreApi:
+    def __init__(self, failing_suffix: str):
+        self._failing_suffix = failing_suffix
+
+    def list_namespaced_pod(self, namespace, label_selector):
+        job_name = label_selector.split("=", 1)[1]
+        failing = job_name.endswith(self._failing_suffix)
+        state = SimpleNamespace(
+            terminated=SimpleNamespace(
+                reason="OOMKilled" if failing else "Completed",
+                exit_code=137 if failing else 0,
+            )
+        )
+        pod = SimpleNamespace(
+            metadata=SimpleNamespace(name=f"{job_name}-pod"),
+            status=SimpleNamespace(container_statuses=[SimpleNamespace(
+                restart_count=0, state=state,
+            )]),
+        )
+        return SimpleNamespace(items=[pod])
+
+    def read_namespaced_pod_log(self, name, namespace, tail_lines):
+        return "worker crashed with MemoryError\n" if self._failing_suffix in name else "ok\n"
+
+
+@pytest.mark.asyncio
+async def test_real_activity_failure_reaches_round_report_with_useful_message(monkeypatch):
+    monkeypatch.setattr(
+        activities_module, "_k8s_batch_and_core",
+        lambda: (_MixedBatchApi("-w1"), _MixedCoreApi("-w1")),
+    )
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        report = await _run(
+            env, [launch_and_watch_pod, cleanup_worker_job],
+            _round_spec(num_workers=3, min_workers=2),
+        )
+
+    # Quorum tolerance for the survivors is unaffected by the fix.
+    assert report.succeeded_ids == [0, 2]
+    assert report.failed_ids == [1]
+    assert report.meets_quorum(2) is True
+
+    failed = next(r for r in report.results if r.worker_id == 1)
+    assert failed.succeeded is False
+    # The C1 log tail and the reason both survive all the way into the round
+    # report's failure_reason, through real retries and the real activity.
+    assert "OOMKilled" in failed.failure_reason
+    assert "MemoryError" in failed.failure_reason
+
+
+@pytest.mark.asyncio
+async def test_real_activity_failure_below_quorum_still_fails_the_round(monkeypatch):
+    from temporalio.client import WorkflowFailureError
+
+    monkeypatch.setattr(
+        activities_module, "_k8s_batch_and_core",
+        lambda: (_MixedBatchApi("-w1"), _MixedCoreApi("-w1")),
+    )
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with pytest.raises(WorkflowFailureError):
+            await _run(
+                env, [launch_and_watch_pod, cleanup_worker_job],
+                _round_spec(num_workers=2, min_workers=2),
+            )

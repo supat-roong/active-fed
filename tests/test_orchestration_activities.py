@@ -9,6 +9,7 @@ from src.orchestration.activities import (
     build_job_manifest,
     classify_job_status,
     job_name_for,
+    launch_and_watch_pod,
 )
 from src.orchestration.types import WorkerSpec
 
@@ -296,3 +297,96 @@ async def test_await_job_deleted_raises_on_timeout_instead_of_hanging():
     batch.delete_namespaced_job(name="x", namespace="ns", propagation_policy="Background")
     with pytest.raises(TimeoutError):
         await _await_job_deleted(batch, "ns", "x", timeout_s=0.05, poll_s=0.01)
+
+
+# ---------------------------------------------------------------------------
+# C1/I1: launch_and_watch_pod itself. Previously untested at any level (I5) --
+# these drive the activity end-to-end against fake Batch/Core clients,
+# monkeypatching _k8s_batch_and_core (the one seam that needs a real
+# kubeconfig) rather than a real cluster.
+# ---------------------------------------------------------------------------
+class FakeBatchApiTerminal:
+    """Job creation succeeds immediately and every subsequent status read
+    reports the given terminal status right away -- exercises
+    launch_and_watch_pod's succeeded/failed branches on the very first poll,
+    without re-exercising _ensure_job's create/409/delete/recreate sequencing
+    (already covered directly by the _ensure_job tests above)."""
+
+    def __init__(self, status):
+        self._status = status
+        self.calls: list[str] = []
+
+    def create_namespaced_job(self, namespace, body):
+        self.calls.append("create")
+
+    def read_namespaced_job_status(self, name, namespace):
+        self.calls.append("read")
+        return SimpleNamespace(status=self._status)
+
+
+def _terminated_pod(name: str, reason: str, exit_code: int, restart_count: int = 0):
+    container_status = SimpleNamespace(
+        restart_count=restart_count,
+        state=SimpleNamespace(terminated=SimpleNamespace(reason=reason, exit_code=exit_code)),
+    )
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name=name),
+        status=SimpleNamespace(container_statuses=[container_status]),
+    )
+
+
+class FakeCoreApi:
+    def __init__(self, pods=None, logs=None):
+        self.pods = pods or []
+        self.logs = logs or {}
+
+    def list_namespaced_pod(self, namespace, label_selector):
+        return SimpleNamespace(items=self.pods)
+
+    def read_namespaced_pod_log(self, name, namespace, tail_lines):
+        return self.logs.get(name, "")
+
+
+async def test_launch_and_watch_pod_raises_with_reason_and_log_tail_on_job_failure(monkeypatch):
+    # C1: the pod's log is the only evidence of *why* a worker died, and it is
+    # captured nowhere on the failure path today -- it must be read here,
+    # before the activity returns/raises, since WorkerWorkflow's cleanup
+    # deletes the Job (and cascades to the pod) within seconds of that.
+    # I1: a Job failure must raise, not return WorkerResult(succeeded=False),
+    # because Temporal only retries activities on raised exceptions.
+    import src.orchestration.activities as activities_module
+    from src.orchestration.activities import WorkerJobFailed
+
+    failed_status = _job_status(conditions=[_condition("Failed", "True")])
+    batch = FakeBatchApiTerminal(failed_status)
+    core = FakeCoreApi(
+        pods=[_terminated_pod("aflw-abcdef12-r3-w2-abc12", "OOMKilled", 137)],
+        logs={"aflw-abcdef12-r3-w2-abc12": "Traceback (most recent call last):\nMemoryError\n"},
+    )
+    monkeypatch.setattr(activities_module, "_k8s_batch_and_core", lambda: (batch, core))
+
+    with pytest.raises(WorkerJobFailed) as exc_info:
+        await launch_and_watch_pod(_spec())
+
+    message = str(exc_info.value)
+    assert "OOMKilled" in message
+    assert "MemoryError" in message
+
+
+async def test_launch_and_watch_pod_returns_normally_on_success(monkeypatch):
+    import src.orchestration.activities as activities_module
+
+    succeeded_status = _job_status(conditions=[_condition("Complete", "True")])
+    batch = FakeBatchApiTerminal(succeeded_status)
+    core = FakeCoreApi(
+        pods=[_terminated_pod("aflw-abcdef12-r3-w2-xyz99", "Completed", 0)],
+        logs={"aflw-abcdef12-r3-w2-xyz99": "training complete\n"},
+    )
+    monkeypatch.setattr(activities_module, "_k8s_batch_and_core", lambda: (batch, core))
+
+    result = await launch_and_watch_pod(_spec())
+
+    assert result.succeeded is True
+    assert result.worker_id == 2
+    assert result.failure_reason == ""
+    assert result.attempts == 1

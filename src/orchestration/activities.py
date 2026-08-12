@@ -265,6 +265,34 @@ async def _await_job_deleted(
         waited += poll_s
 
 
+# How many trailing lines of a failed pod's log to fold into the raised
+# failure. Bounded on purpose: the diagnostic must survive into Temporal's
+# history, not reproduce the whole log there.
+FAILURE_LOG_TAIL_LINES = 20
+
+
+class WorkerJobFailed(Exception):
+    """A worker's Kubernetes Job reached a terminal Failed state.
+
+    C1/I1 (final review): raised instead of returned as
+    WorkerResult(succeeded=False, ...), because a normal activity return is an
+    activity *success* to Temporal no matter what the payload says --
+    RetryPolicy(maximum_attempts=3) on this activity (workflows.py) only ever
+    fires for raised exceptions. Returning here silently dropped a worker from
+    3 attempts to 1 the moment F5 also removed Kubernetes' own retry
+    (backoffLimit 2->0, restartPolicy OnFailure->Never), leaving nothing to
+    own retry at all.
+
+    Deliberately left retryable (not added to non_retryable_error_types in
+    workflows.py): a crashed container is not assumed permanent -- it may be a
+    transient node/resource issue -- and _ensure_job's delete-and-recreate
+    branch exists precisely so a retried attempt gets a fresh Job/pod rather
+    than re-observing the same dead one. Contrast job_name_for's ValueError,
+    which is a deterministic input-validation failure -- retrying it three
+    times cannot change the outcome, so that one *is* marked non-retryable.
+    """
+
+
 @activity.defn
 async def launch_and_watch_pod(spec: WorkerSpec) -> WorkerResult:
     """Create the worker Job if absent, then watch it to completion.
@@ -300,12 +328,15 @@ async def launch_and_watch_pod(spec: WorkerSpec) -> WorkerResult:
                 attempts=await _attempt_count(core, spec, name), failure_reason="", job_name=name,
             )
         if outcome == "failed":
+            # C1: capture the pod's log tail *before* returning -- WorkerWorkflow's
+            # `finally` deletes the Job (and cascades to its pods) within seconds
+            # of this activity completing, so this is the last chance to read it.
             reason = await _failure_reason(core, spec, name)
-            return WorkerResult(
-                worker_id=spec.worker_id, succeeded=False,
-                attempts=await _attempt_count(core, spec, name), failure_reason=reason,
-                job_name=name,
-            )
+            tail = await _log_tail(core, spec, name, lines=FAILURE_LOG_TAIL_LINES)
+            message = f"worker {spec.worker_id} job {name} failed: {reason}"
+            if tail:
+                message += f"\n--- last {FAILURE_LOG_TAIL_LINES} log lines ---\n{tail}"
+            raise WorkerJobFailed(message)
 
         activity.heartbeat(
             {"worker_id": spec.worker_id, "active": int(status.active or 0), "waited_s": waited}
@@ -369,18 +400,30 @@ async def _failure_reason(core, spec: WorkerSpec, job_name: str) -> str:
         return f"unavailable: {e}"
 
 
-async def _log_tail(core, spec: WorkerSpec, job_name: str, lines: int = 20) -> None:
+async def _log_tail(
+    core, spec: WorkerSpec, job_name: str, lines: int = FAILURE_LOG_TAIL_LINES
+) -> str:
+    """Best-effort tail of the job's pod logs, bounded to `lines`.
+
+    Returns the captured text so callers can fold it into a failure message
+    (C1) — never raises, matching _failure_reason's contract that a
+    diagnostic failure must never mask the real outcome.
+    """
     try:
         pods = core.list_namespaced_pod(
             namespace=spec.namespace, label_selector=f"job-name={job_name}"
         )
+        chunks = []
         for pod in pods.items:
             text = core.read_namespaced_pod_log(
                 name=pod.metadata.name, namespace=spec.namespace, tail_lines=lines
             )
             activity.logger.info(f"[{pod.metadata.name}] {text}")
+            chunks.append(f"[{pod.metadata.name}] {text}")
+        return "\n".join(chunks)
     except Exception as e:
         activity.logger.warning(f"could not read logs for {job_name}: {e}")
+        return ""
 
 
 @activity.defn

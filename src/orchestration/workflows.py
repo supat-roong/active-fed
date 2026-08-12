@@ -74,6 +74,15 @@ class WorkerWorkflow:
                 retry_policy=RetryPolicy(
                     maximum_attempts=3,
                     initial_interval=timedelta(seconds=10),
+                    # job_name_for's ValueError is a deterministic input-
+                    # validation failure (an unsubstituted KFP placeholder or
+                    # similar): every retry would build the exact same
+                    # invalid name and fail identically, so retrying it three
+                    # times only adds latency. A genuine worker/Job failure
+                    # (WorkerJobFailed, activities.py) is deliberately *not*
+                    # listed here -- it may be transient, and is exactly the
+                    # case this retry policy exists to cover.
+                    non_retryable_error_types=["ValueError"],
                 ),
             )
             self._status.phase = "Succeeded" if result.succeeded else "Failed"
