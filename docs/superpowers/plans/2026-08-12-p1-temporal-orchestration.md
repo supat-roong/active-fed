@@ -40,6 +40,7 @@ From `docs/superpowers/reviews/2026-08-12-P0-deferred-findings.md`:
 |---|---|
 | `lib/temporal.sh` | `fed_temporal_install` — Helm repo add, install Temporal + PostgreSQL, wait for frontend |
 | `tests/temporal.bats` | Unit tests with the `helm` stub |
+| `manifests/temporal-postgres.yaml.tpl` | PostgreSQL StatefulSet + Service — the chart has no postgres dependency |
 | `tests/stubs/helm` | New stub — records argv, honours `STUB_HELM_FAIL_GLOB` |
 
 **`active-fed` — new**
@@ -168,8 +169,14 @@ Expected: FAIL — `lib/temporal.sh: No such file or directory`
 #
 # The chart bundles Elasticsearch, Prometheus and Grafana by default. All three
 # are disabled here: this is a local single-node kind cluster, and Elasticsearch
-# alone would roughly double the memory footprint. Visibility falls back to the
-# PostgreSQL store, which is sufficient for workflow listing and history.
+# alone would roughly double the memory footprint.
+#
+# Two chart facts, both established by running `helm template` against 0.62.0:
+#   1. There is NO postgresql subchart. `postgresql.enabled=true` is a phantom
+#      value that silently does nothing. We deploy our own database.
+#   2. Visibility has its own persistence store. Switching only `default` to sql
+#      leaves visibility on cassandra and the chart aborts with
+#      "Please specify cassandra port for visibility store".
 
 fed_temporal_install() {
   local ns=$1 ver=$2
@@ -183,17 +190,38 @@ fed_temporal_install() {
   helm repo add temporal https://go.temporal.io/helm-charts || return 1
   helm repo update >/dev/null 2>&1 || return 1
 
+  # The chart has NO postgresql dependency (only cassandra/prometheus/
+  # elasticsearch/grafana), so we supply our own database first.
+  fed_log "deploying PostgreSQL for Temporal into ${ns}"
+  fed_apply "${FED_INFRA_ROOT}/manifests/temporal-postgres.yaml.tpl" temporal-postgres
+  kubectl rollout status statefulset/temporal-postgresql -n "$ns" --timeout=300s || return 1
+
+  # BOTH the default and visibility stores must be switched to sql. Overriding
+  # only `default` leaves visibility on its cassandra default and the chart
+  # aborts with "Please specify cassandra port for visibility store".
   fed_log "installing Temporal ${ver} into ${ns}"
   helm upgrade --install temporal temporal/temporal \
     --namespace "$ns" --create-namespace \
     --version "$ver" \
     --set server.replicaCount=1 \
     --set cassandra.enabled=false \
-    --set postgresql.enabled=true \
-    --set server.config.persistence.default.driver=sql \
     --set elasticsearch.enabled=false \
     --set prometheus.enabled=false \
     --set grafana.enabled=false \
+    --set server.config.persistence.default.driver=sql \
+    --set server.config.persistence.default.sql.driver=postgres12 \
+    --set server.config.persistence.default.sql.host=temporal-postgresql \
+    --set server.config.persistence.default.sql.port=5432 \
+    --set server.config.persistence.default.sql.database="${FED_TEMPORAL_DB_NAME}" \
+    --set server.config.persistence.default.sql.user="${FED_TEMPORAL_DB_USER}" \
+    --set server.config.persistence.default.sql.password="${FED_TEMPORAL_DB_PASSWORD}" \
+    --set server.config.persistence.visibility.driver=sql \
+    --set server.config.persistence.visibility.sql.driver=postgres12 \
+    --set server.config.persistence.visibility.sql.host=temporal-postgresql \
+    --set server.config.persistence.visibility.sql.port=5432 \
+    --set server.config.persistence.visibility.sql.database="${FED_TEMPORAL_DB_NAME}_visibility" \
+    --set server.config.persistence.visibility.sql.user="${FED_TEMPORAL_DB_USER}" \
+    --set server.config.persistence.visibility.sql.password="${FED_TEMPORAL_DB_PASSWORD}" \
     --wait --timeout 15m || return 1
 
   fed_log "waiting for the Temporal frontend"
@@ -201,18 +229,93 @@ fed_temporal_install() {
 }
 ```
 
+- [ ] **Step 4b: Create `manifests/temporal-postgres.yaml.tpl`**
+
+The Temporal chart has no PostgreSQL dependency, so the database is ours to
+provide. Mirror the shape of `manifests/minio.yaml.tpl`.
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: temporal-postgresql
+  namespace: ${FED_TEMPORAL_NAMESPACE}
+spec:
+  serviceName: temporal-postgresql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: temporal-postgresql
+  template:
+    metadata:
+      labels:
+        app: temporal-postgresql
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          env:
+            - name: POSTGRES_USER
+              value: "${FED_TEMPORAL_DB_USER}"
+            - name: POSTGRES_PASSWORD
+              value: "${FED_TEMPORAL_DB_PASSWORD}"
+            - name: POSTGRES_DB
+              value: "${FED_TEMPORAL_DB_NAME}"
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "${FED_TEMPORAL_DB_USER}"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal-postgresql
+  namespace: ${FED_TEMPORAL_NAMESPACE}
+spec:
+  selector:
+    app: temporal-postgresql
+  ports:
+    - port: 5432
+      targetPort: 5432
+  type: ClusterIP
+```
+
+The chart's schema job creates the `_visibility` database itself, so only the
+primary database is seeded here.
+
 - [ ] **Step 5: Add config defaults**
 
 In `lib/config.sh`, inside `fed_config_defaults`, after the KFP defaults:
 
 ```bash
   : "${FED_TEMPORAL_VERSION:=0.62.0}"
-  : "${FED_TEMPORAL_NAMESPACE:=${FED_NAMESPACE}}"
+  : "${FED_TEMPORAL_NAMESPACE:=${FED_NAMESPACE:-}}"
+  : "${FED_TEMPORAL_DB_NAME:=temporal}"
+  : "${FED_TEMPORAL_DB_USER:=temporal}"
+  : "${FED_TEMPORAL_DB_PASSWORD:=temporal}"
   : "${FED_NODEPORT_TEMPORAL_UI:=30733}"
   : "${FED_HOSTPORT_TEMPORAL_UI:=8233}"
 ```
 
-Add all four to the `export` list in the same function.
+Add all seven to the `export` list in the same function.
+
+**Then add `${FED_TEMPORAL_NAMESPACE}`, `${FED_TEMPORAL_DB_NAME}`, `${FED_TEMPORAL_DB_USER}` and `${FED_TEMPORAL_DB_PASSWORD}` to `FED_TEMPLATE_VARS` in `lib/render.sh`** — the new PostgreSQL manifest references all four, and a variable missing from the whitelist renders as an empty string with no error.
 
 - [ ] **Step 6: Wire into dispatch**
 
