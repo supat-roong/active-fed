@@ -13,4 +13,7 @@ docker build -t active-fed-aggregator:v1 -f "${ROOT_DIR}/docker/Dockerfile.aggre
 echo "Applying Active-FL RBAC..."
 kubectl apply -f "${ROOT_DIR}/k8s/rbac.yaml"
 
+echo "Applying Temporal worker..."
+kubectl apply -f "${ROOT_DIR}/k8s/temporal-worker.yaml"
+
 echo "Run 'make local-teardown' to destroy the cluster."
