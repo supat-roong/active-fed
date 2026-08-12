@@ -223,6 +223,54 @@ make local-teardown
 
 ---
 
+## Observability: Three Surfaces
+
+Running the K8s pipeline (`make run-pipeline`) gives you three UIs, each answering a
+different question. They never overlap in scope — KFP sequences *rounds*, Temporal manages
+the worker *fleet inside* a round, and MLflow tracks *ML metrics* — so there's no ambiguity
+about which one to open for a given question.
+
+| Surface | URL | Answers |
+|---|---|---|
+| **Kubeflow Pipelines** | http://localhost:8080 | Round DAG (`train → aggregate → evaluate`), node logs, artifact lineage |
+| **Temporal Web** | http://localhost:8233 | Which worker is running and for how long, retry counts, live per-worker progress |
+| **MLflow** | http://localhost:5050 | Reward curves, client scores, acceptance rate, active-data usage |
+
+### Reading per-worker progress in Temporal
+
+Each FL round starts one `TrainRoundWorkflow` (workflow ID `train-<8hex>-r<round>`, where
+`<8hex>` is the first 8 characters of the KFP run ID) that fans out one `WorkerWorkflow` child
+per worker (`train-<8hex>-r<round>-w<worker>`). In the Temporal UI:
+
+1. Open the `TrainRoundWorkflow` for the round you care about — it lists `N` `WorkerWorkflow`
+   children (one per worker).
+2. Open a child `WorkerWorkflow`. While its worker pod is training, the **Pending Activities**
+   panel shows the `launch_and_watch_pod` activity with **heartbeat details** —
+   `{"worker_id": ..., "active": ..., "waited_s": ...}` — updated every 5 seconds. This live
+   heartbeat is what replaces the old PyTorchJob path's opaque 20-minute ceiling: you can see
+   exactly which worker is still running and for how long, instead of waiting on one
+   fleet-wide timer.
+3. If the *activity code itself* fails or times out (e.g. an unrecoverable Kubernetes API
+   error, or the pod-watch timeout), that `WorkerWorkflow` shows the retry attempt and the
+   *root-cause* failure message for that worker specifically, not a generic whole-fleet error.
+   **Known limitation:** if only the worker's *pod* is lost (killed, evicted, node drain) while
+   its Job still has budget left, Kubernetes' own Job controller silently replaces the pod
+   before the 5-second poll notices anything — the `WorkerWorkflow` then reports a clean
+   success with no visible retry, even though a different pod actually did the work. Per-pod
+   attribution is therefore only as good as what the Job object itself reports; check
+   `kubectl get pods -n active-fed -l app=active-fl-worker` directly if you need to know
+   whether a specific pod was replaced mid-round.
+4. The underlying Kubernetes Job for each worker is named deterministically:
+   `aflw-<8hex>-r<round>-w<worker>` — one Job per (round, worker), safe to re-attach to on
+   retry instead of racing a second Job onto the same MinIO keys.
+
+```bash
+# Inspect worker Jobs/Pods for the current pipeline run
+kubectl get jobs -n active-fed -l app=active-fl-worker
+kubectl get pods -n active-fed -l app=active-fl-worker
+```
+
+---
 
 ## What to see in MLflow (Local & K8s)
 
@@ -248,7 +296,8 @@ src/
   agent/          PPO ActorCritic model, PPO agent, worker entrypoint
   aggregator/     Evaluator, scorer, aggregator (Active Weight + Data), MinIO collector
   experiment/     Local FL runner (no K8s)
-  pipelines/      Kubeflow DSL pipeline definition
+  orchestration/  Temporal workflows/activities/worker entrypoint (per-round worker fleet)
+  pipelines/      Kubeflow DSL pipeline definition (drives the fleet through Temporal)
   tracking/       MLflow helpers
 config/
   local.yaml      Hyperparameters + combinations for local experiments
@@ -258,9 +307,9 @@ experiments/
 analysis/
   compare_runs.py     Comparison visualization (6 plots)
   fetch_k8s_runs.py   Download results from remote MLflow (K8s runs)
-k8s/              Manifests: MinIO, MLflow, RBAC, PyTorchJob template
+k8s/              Manifests: RBAC (worker Job + Temporal-worker access), Temporal worker Deployment
 docker/           Worker + aggregator Dockerfiles
-setup/            kind cluster bootstrap + teardown scripts
+setup/            kind cluster bootstrap + teardown scripts (delegates to vendor/fed-infra)
 run_pipeline.sh   Kubeflow pipeline trigger script
 tests/            Unit tests across all components
 results/          Experiment outputs (JSON + plots)
@@ -281,6 +330,8 @@ make run-experiments  run all combinations from config/local.yaml (parallel)
 make run-single       WEIGHT_MODE=X ACTIVE_DATA_MODE=Y  (single combo)
 make dry-run-worker   smoke-test worker entrypoint locally (no K8s)
 make mlflow-ui        launch MLflow UI against ./mlruns (http://localhost:5000)
+make temporal-ui      print the Temporal UI URL (http://localhost:8233)
+make run-temporal-worker  run the orchestration worker locally (no K8s Deployment)
 make compare          regenerate plots from results/
 make compare-k8s      fetch remote MLflow results + regenerate plots
 make compile-pipeline compile Kubeflow pipeline → /tmp/active_fl_pipeline.yaml
