@@ -22,10 +22,13 @@
 All five were identified by reading the code during the P0 design and confirmed against the current tree.
 
 1. **Round-0 divergence (correctness, silent, highest priority).** In the K8s path round 0 has no `round_0/global.pt`, so `_fetch_global_weights` returns `None` (`src/agent/train_worker.py:76-79`) and every worker keeps **its own independently random** `ActorCritic` — no seed is set in the worker entrypoint. Round 0 therefore averages N unrelated random networks. `src/experiment/local_runner.py:148` does it correctly: it builds `global_weights` once and calls `set_weights` on every worker. **Local and K8s results are not comparable at round 0 today**, which invalidates any cross-mode conclusion drawn from round-0 behaviour.
-2. **Non-idempotent job naming** — fixed in P1 by deterministic Temporal workflow and Job names. This phase removes the now-dead PyTorchJob path that still carries `uuid.uuid4()`.
-3. **`restartPolicy: Never`** on the legacy PyTorchJob path — a crashed worker vanished and the aggregator silently proceeded with N−1 clients. Removed with the path.
-4. **Hard 20-minute timeout with no retry** — replaced in P1 by heartbeat-based liveness. Removed with the path.
+2. **Non-idempotent job naming** — **already resolved in P1.** Job names are deterministic (`aflw-<run_uid>-r<N>-w<M>`, verified live) and the workflow ID is deterministic with `USE_EXISTING` conflict handling. Nothing left to do.
+3. **`restartPolicy: Never` on the legacy PyTorchJob path** — **already resolved in P1.** That path is gone. Note the current `restartPolicy: Never` in `build_job_manifest` is a *different, deliberate* choice made in P1's gate fixes: with `backoffLimit: 0`, Kubernetes does not retry and Temporal owns retry exclusively. **Do not change it.**
+4. **Hard 20-minute timeout with no retry** — **already resolved in P1** by heartbeat-based liveness. Nothing left to do.
+
 5. **Silently swallowed post-processing failures.** `subprocess.run(..., check=False)` in `src/pipelines/run_pipeline.py:163-193` discards fetch and plot errors, so a sweep reports success while producing no plots.
+
+**Verified remaining scope for P2** (checked against the tree after P1 landed): items 1 and 5 below, plus `start_round` resume and removal of the `worker_launcher` flag. Items 2-4 are done.
 
 ---
 
