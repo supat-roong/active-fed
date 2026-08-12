@@ -30,6 +30,26 @@ with workflow.unsafe.imports_passed_through():
 TASK_QUEUE = "active-fed"
 
 
+def _root_cause_message(exc: BaseException) -> str:
+    """Walk an exception's cause chain to the innermost non-empty message.
+
+    A child-workflow failure's own message is always the generic wrapper text
+    ("Child Workflow execution failed") regardless of what actually killed the
+    worker; the real reason is further down the `.cause` chain (e.g.
+    ChildWorkflowError -> ActivityError -> ApplicationError("boom")). Without
+    this, RoundReport tells you a worker died but never why. Pure and
+    deterministic — only walks `__cause__`, no I/O.
+    """
+    message = str(exc)
+    current: BaseException | None = exc
+    while current is not None:
+        text = str(current)
+        if text:
+            message = text
+        current = current.__cause__
+    return message
+
+
 @workflow.defn
 class WorkerWorkflow:
     """One durable entity per (round, worker).
@@ -62,13 +82,19 @@ class WorkerWorkflow:
         finally:
             # Runs on success, failure and cancellation. Without it a failed
             # round leaves orphaned Jobs that collide with the next attempt's
-            # deterministic names.
-            await workflow.execute_activity(
-                "cleanup_worker_job",
-                spec,
-                start_to_close_timeout=timedelta(seconds=120),
-                retry_policy=RetryPolicy(maximum_attempts=2),
-            )
+            # deterministic names. Cleanup is best-effort housekeeping: if it
+            # fails, that failure must never overwrite or mask the worker's
+            # real outcome, which is exactly the diagnostic this phase exists
+            # to surface.
+            try:
+                await workflow.execute_activity(
+                    "cleanup_worker_job",
+                    spec,
+                    start_to_close_timeout=timedelta(seconds=120),
+                    retry_policy=RetryPolicy(maximum_attempts=2),
+                )
+            except Exception as e:  # noqa: BLE001 - cleanup must never mask the real result
+                workflow.logger.warning(f"cleanup failed for worker {spec.worker_id}: {e}")
 
     @workflow.query
     def status(self) -> WorkerStatus:
@@ -87,12 +113,26 @@ class TrainRoundWorkflow:
         parent_id = workflow.info().workflow_id
 
         async def _one(worker_id: int) -> WorkerResult:
-            return await workflow.execute_child_workflow(
-                WorkerWorkflow.run,
-                spec.worker_spec(worker_id),
-                id=f"{parent_id}-w{worker_id}",
-                task_queue=TASK_QUEUE,
+            self._statuses[worker_id] = WorkerStatus(worker_id=worker_id, phase="Running")
+            try:
+                res = await workflow.execute_child_workflow(
+                    WorkerWorkflow.run,
+                    spec.worker_spec(worker_id),
+                    id=f"{parent_id}-w{worker_id}",
+                    task_queue=TASK_QUEUE,
+                )
+            except Exception as e:
+                self._statuses[worker_id] = WorkerStatus(
+                    worker_id=worker_id, phase="Failed", message=str(e)
+                )
+                raise
+            self._statuses[worker_id] = WorkerStatus(
+                worker_id=worker_id,
+                phase="Succeeded" if res.succeeded else "Failed",
+                attempt=res.attempts,
+                message=res.failure_reason,
             )
+            return res
 
         # return_exceptions=True so one dead worker does not abort the fleet;
         # the quorum check below decides whether the round can still proceed.
@@ -106,7 +146,7 @@ class TrainRoundWorkflow:
                 results.append(
                     WorkerResult(
                         worker_id=worker_id, succeeded=False, attempts=0,
-                        failure_reason=str(item), job_name="",
+                        failure_reason=_root_cause_message(item), job_name="",
                     )
                 )
             else:
