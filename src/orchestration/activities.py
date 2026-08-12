@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 from temporalio import activity
 
@@ -95,6 +96,32 @@ def build_job_manifest(spec: WorkerSpec) -> dict:
     }
 
 
+def classify_job_status(status: Any, backoff_limit: int) -> str:
+    """Classify a Job's status as 'succeeded', 'failed', or 'running'. Pure.
+
+    Conditions ('Complete'/'Failed') are the primary signal: they are the Job
+    controller's own terminal determination and are restartPolicy-independent.
+    `status.succeeded` is kept only as a secondary success signal.
+
+    Comparing `status.failed > backoff_limit` was previously the *only* failure
+    signal, and it is unreliable: measured against a live cluster running a
+    Job with `restartPolicy: OnFailure` and `backoffLimit: 2` whose container
+    always exits 1, `status.failed` settled at 1 and never exceeded
+    `backoff_limit`, so that branch never fired. A genuinely exhausted Job kept
+    polling until POD_WATCH_TIMEOUT_S and was misreported as a timeout. The
+    failed-count comparison is kept only as a defense-in-depth fallback for the
+    case where the Failed condition hasn't propagated yet.
+    """
+    conditions = {c.type: c.status for c in (status.conditions or [])}
+    if conditions.get("Complete") == "True" or status.succeeded:
+        return "succeeded"
+    if conditions.get("Failed") == "True":
+        return "failed"
+    if status.failed and status.failed > backoff_limit:
+        return "failed"
+    return "running"
+
+
 def _k8s_batch_and_core():
     """Import and configure the Kubernetes client lazily.
 
@@ -134,19 +161,29 @@ async def launch_and_watch_pod(spec: WorkerSpec) -> WorkerResult:
 
     waited = 0
     while waited < POD_WATCH_TIMEOUT_S:
-        job = batch.read_namespaced_job_status(name=name, namespace=spec.namespace)
+        try:
+            job = batch.read_namespaced_job_status(name=name, namespace=spec.namespace)
+        except ApiException as e:
+            if e.status == 404:  # Job vanished mid-watch (e.g. deleted out-of-band)
+                return WorkerResult(
+                    worker_id=spec.worker_id, succeeded=False, attempts=0,
+                    failure_reason=f"Job {name} disappeared mid-watch (404)", job_name=name,
+                )
+            raise
         status = job.status
-        if status.succeeded:
+        outcome = classify_job_status(status, manifest["spec"]["backoffLimit"])
+        if outcome == "succeeded":
             await _log_tail(core, spec, name)
             return WorkerResult(
                 worker_id=spec.worker_id, succeeded=True,
-                attempts=int(status.failed or 0) + 1, failure_reason="", job_name=name,
+                attempts=await _attempt_count(core, spec, name), failure_reason="", job_name=name,
             )
-        if status.failed and status.failed > manifest["spec"]["backoffLimit"]:
+        if outcome == "failed":
             reason = await _failure_reason(core, spec, name)
             return WorkerResult(
                 worker_id=spec.worker_id, succeeded=False,
-                attempts=int(status.failed), failure_reason=reason, job_name=name,
+                attempts=await _attempt_count(core, spec, name), failure_reason=reason,
+                job_name=name,
             )
 
         activity.heartbeat(
@@ -159,6 +196,28 @@ async def launch_and_watch_pod(spec: WorkerSpec) -> WorkerResult:
         worker_id=spec.worker_id, succeeded=False, attempts=0,
         failure_reason=f"timed out after {POD_WATCH_TIMEOUT_S}s", job_name=name,
     )
+
+
+async def _attempt_count(core, spec: WorkerSpec, job_name: str) -> int:
+    """Container attempts (restarts + 1) for the job's pod.
+
+    Chosen over `status.failed`/`status.succeeded`: under `restartPolicy:
+    OnFailure`, Kubernetes restarts the *container* in place rather than
+    replacing the Pod, so those Job-level counters count Pods, not attempts,
+    and cannot report the retry count they were previously assumed to give.
+    `containerStatuses[0].restartCount` is the accurate source.
+    """
+    try:
+        pods = core.list_namespaced_pod(
+            namespace=spec.namespace, label_selector=f"job-name={job_name}"
+        )
+        for pod in pods.items:
+            statuses = pod.status.container_statuses or []
+            if statuses:
+                return statuses[0].restart_count + 1
+        return 1
+    except Exception:  # best-effort; never fail the activity over a diagnostic
+        return 1
 
 
 async def _failure_reason(core, spec: WorkerSpec, job_name: str) -> str:

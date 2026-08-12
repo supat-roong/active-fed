@@ -1,5 +1,6 @@
+from types import SimpleNamespace
 
-from src.orchestration.activities import build_job_manifest, job_name_for
+from src.orchestration.activities import build_job_manifest, classify_job_status, job_name_for
 from src.orchestration.types import WorkerSpec
 
 
@@ -63,3 +64,47 @@ def test_manifest_labels_identify_round_and_worker():
     assert labels["app"] == "active-fl-worker"
     assert labels["fl-round"] == "3"
     assert labels["worker-id"] == "2"
+
+
+def _condition(type_: str, status: str) -> SimpleNamespace:
+    return SimpleNamespace(type=type_, status=status)
+
+
+def _job_status(conditions=None, succeeded=None, failed=None) -> SimpleNamespace:
+    return SimpleNamespace(conditions=conditions, succeeded=succeeded, failed=failed)
+
+
+def test_classify_job_status_succeeded_on_complete_condition():
+    status = _job_status(conditions=[_condition("Complete", "True")])
+    assert classify_job_status(status, backoff_limit=2) == "succeeded"
+
+
+def test_classify_job_status_succeeded_via_status_succeeded_without_condition():
+    status = _job_status(conditions=[], succeeded=1)
+    assert classify_job_status(status, backoff_limit=2) == "succeeded"
+
+
+def test_classify_job_status_failed_on_failed_condition():
+    status = _job_status(conditions=[_condition("Failed", "True")])
+    assert classify_job_status(status, backoff_limit=2) == "failed"
+
+
+def test_classify_job_status_running_when_neither_condition_present():
+    status = _job_status(conditions=[])
+    assert classify_job_status(status, backoff_limit=2) == "running"
+
+
+def test_classify_job_status_falls_back_to_failed_count_over_backoff_limit():
+    status = _job_status(conditions=[], failed=3)
+    assert classify_job_status(status, backoff_limit=2) == "failed"
+
+
+def test_classify_job_status_failed_condition_wins_even_when_failed_count_is_low():
+    # Regression guard: on a live cluster with restartPolicy OnFailure and
+    # backoffLimit=2, status.failed was observed to settle at 1 and never
+    # exceed backoffLimit, so a decision that only compares
+    # status.failed > backoff_limit never fires and a genuine failure gets
+    # misreported as a 1-hour timeout. The Failed condition must be
+    # authoritative regardless of the failed-pod count.
+    status = _job_status(conditions=[_condition("Failed", "True")], failed=1)
+    assert classify_job_status(status, backoff_limit=2) == "failed"
