@@ -17,6 +17,8 @@ dependencies = [
     "requests>=2.31.0",
     "tqdm>=4.66.0",
     "boto3>=1.42.59",
+    "temporalio>=1.7.0",
+    "kubernetes>=29.0.0",
 ]
 
 [project.optional-dependencies]
