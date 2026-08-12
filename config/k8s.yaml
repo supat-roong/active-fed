@@ -12,9 +12,15 @@ experiment:
 training:
   fl_rounds: 2
   num_workers: 2               # parallel PPO workers
+  min_workers: 2               # workers that must succeed for a round to count
   local_episodes: 10           # episodes each worker trains per round
   eval_episodes: 5             # CartPole episodes for target-env evaluation probe
   env_id: CartPole-v1
+
+# --- Orchestration ---
+orchestration:
+  worker_launcher: temporal      # temporal | pytorchjob (pytorchjob removed in P2)
+  temporal_address: temporal-frontend.active-fed.svc.cluster.local:7233
 
 # --- Aggregation Params ---
 aggregation:

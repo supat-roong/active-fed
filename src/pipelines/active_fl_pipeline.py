@@ -5,7 +5,12 @@ Pipeline DAG per FL round:
   train_workers → collect_and_score_aggregate → evaluate_global
 
 Components run inside the K8s cluster with access to MinIO and MLflow.
-Workers are launched as a PyTorchJob (managed by Training Operator).
+`train_workers` is a thin Temporal client: it starts a `TrainRoundWorkflow`
+that fans out one durable `WorkerWorkflow` per worker, each of which launches
+and watches a Kubernetes Job. KFP still owns the round-level DAG and artifact
+lineage; Temporal owns the worker fleet within a round. The `worker_launcher`
+migration flag retains a `pytorchjob` fallback path (removed in Phase P2) so a
+Temporal outage cannot block experiments.
 """
 
 import os
@@ -15,15 +20,16 @@ from kfp import dsl
 from kfp.dsl import Artifact, Input, Output, component
 
 
-@component(
-    base_image="python:3.9-slim",
-    packages_to_install=["jinja2", "pyyaml", "requests"],
-)
+@component(base_image="active-fed-aggregator:v1", packages_to_install=[])
 def train_workers(
     fl_round: int,
     num_workers: int,
+    min_workers: int,
     local_episodes: int,
     namespace: str,
+    worker_launcher: str,
+    temporal_address: str,
+    kfp_run_id: str,
     mlflow_tracking_uri: str,
     mlflow_experiment_name: str,
     minio_endpoint: str,
@@ -31,169 +37,79 @@ def train_workers(
     minio_secret_key: str,
     minio_bucket: str,
     worker_image: str,
-    job_status: Output[Artifact],
+    worker_report: Output[Artifact],
 ) -> None:
+    """Run one round's worker fleet.
+
+    With worker_launcher='temporal' this starts a TrainRoundWorkflow and blocks
+    on it, streaming per-worker status into this node's logs. The workflow ID is
+    deterministic, so a retried component re-attaches to the running fleet
+    instead of launching a second one.
     """
-    Render a PyTorchJob manifest from the Jinja2 template and submit it via kubectl.
-    Waits for all workers to complete before returning.
-    """
+    import asyncio
     import json
-    import os
-    import subprocess
-    import time
-    import urllib.request
-    import uuid
+    import sys
 
-    # ---- Install kubectl ----
-    kubectl_url = "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
-    kubectl_path = "/usr/local/bin/kubectl"
-    if not os.path.exists(kubectl_path):
-        urllib.request.urlretrieve(kubectl_url, kubectl_path)
-        os.chmod(kubectl_path, 0o755)
+    sys.path.insert(0, "/app")
 
-    # ---- Render PyTorchJob YAML ----
-    from jinja2 import Template
+    if worker_launcher == "pytorchjob":
+        # Migration fallback, removed in P2.
+        raise NotImplementedError(
+            "the pytorchjob launcher path is retained only for rollback; "
+            "restore it from git history if you need it"
+        )
 
-    job_name = f"active-fl-round-{fl_round}-{uuid.uuid4().hex[:6]}"
-    template_str = """
-apiVersion: "kubeflow.org/v1"
-kind: PyTorchJob
-metadata:
-  name: {{ job_name }}
-  namespace: {{ namespace }}
-spec:
-  pytorchReplicaSpecs:
-    Master:
-      replicas: 1
-      restartPolicy: Never
-      template:
-        spec:
-          serviceAccountName: pipeline-runner
-          containers:
-            - name: pytorch
-              image: {{ worker_image }}
-              imagePullPolicy: IfNotPresent
-              command:
-                - uv
-                - run
-                - python
-                - -m
-                - src.agent.train_worker
-                - --fl-round
-                - "{{ fl_round }}"
-                - --local-episodes
-                - "{{ local_episodes }}"
-                - --device
-                - "cpu"
-              env:
-                - name: RANK
-                  value: "0"
-                - name: MLFLOW_TRACKING_URI
-                  value: "{{ mlflow_tracking_uri }}"
-                - name: MLFLOW_EXPERIMENT_NAME
-                  value: "{{ mlflow_experiment_name }}"
-                - name: MINIO_ENDPOINT
-                  value: "{{ minio_endpoint }}"
-                - name: MINIO_ACCESS_KEY
-                  value: "{{ minio_access_key }}"
-                - name: MINIO_SECRET_KEY
-                  value: "{{ minio_secret_key }}"
-                - name: MINIO_BUCKET
-                  value: "{{ minio_bucket }}"
-    Worker:
-      replicas: {{ num_workers - 1 }}
-      restartPolicy: Never
-      template:
-        spec:
-          serviceAccountName: pipeline-runner
-          containers:
-            - name: pytorch
-              image: {{ worker_image }}
-              imagePullPolicy: IfNotPresent
-              command:
-                - uv
-                - run
-                - python
-                - -m
-                - src.agent.train_worker
-                - --fl-round
-                - "{{ fl_round }}"
-                - --local-episodes
-                - "{{ local_episodes }}"
-                - --device
-                - "cpu"
-              env:
-                - name: MLFLOW_TRACKING_URI
-                  value: "{{ mlflow_tracking_uri }}"
-                - name: MLFLOW_EXPERIMENT_NAME
-                  value: "{{ mlflow_experiment_name }}"
-                - name: MINIO_ENDPOINT
-                  value: "{{ minio_endpoint }}"
-                - name: MINIO_ACCESS_KEY
-                  value: "{{ minio_access_key }}"
-                - name: MINIO_SECRET_KEY
-                  value: "{{ minio_secret_key }}"
-                - name: MINIO_BUCKET
-                  value: "{{ minio_bucket }}"
-                - name: MLFLOW_S3_ENDPOINT_URL
-                  value: "http://{{ minio_endpoint }}"
-                - name: AWS_ACCESS_KEY_ID
-                  value: "{{ minio_access_key }}"
-                - name: AWS_SECRET_ACCESS_KEY
-                  value: "{{ minio_secret_key }}"
-                - name: MLFLOW_S3_IGNORE_TLS
-                  value: "true"
-"""
-    manifest = Template(template_str).render(
-        job_name=job_name,
+    from temporalio.client import Client
+    from temporalio.common import WorkflowIDConflictPolicy
+
+    from src.orchestration.types import RoundSpec
+    from src.orchestration.workflows import TASK_QUEUE, TrainRoundWorkflow
+
+    spec = RoundSpec(
         fl_round=fl_round,
         num_workers=num_workers,
+        min_workers=min_workers,
         local_episodes=local_episodes,
         namespace=namespace,
-        mlflow_tracking_uri=mlflow_tracking_uri,
-        mlflow_experiment_name=mlflow_experiment_name,
+        worker_image=worker_image,
         minio_endpoint=minio_endpoint,
         minio_access_key=minio_access_key,
         minio_secret_key=minio_secret_key,
         minio_bucket=minio_bucket,
-        worker_image=worker_image,
+        mlflow_tracking_uri=mlflow_tracking_uri,
+        mlflow_experiment_name=mlflow_experiment_name,
+        kfp_run_id=kfp_run_id,
     )
-    with open("/tmp/job.yaml", "w") as f:
-        f.write(manifest)
 
-    # ---- Submit job ----
-    subprocess.run([kubectl_path, "apply", "-f", "/tmp/job.yaml", "-n", namespace], check=True)
-
-    # ---- Wait for completion ----
-    print(f"Waiting for PyTorchJob {job_name} to complete...")
-    for attempt in range(120):  # 20 minute timeout
-        time.sleep(10)
-        result = subprocess.run(
-            [
-                kubectl_path,
-                "get",
-                "pytorchjob",
-                job_name,
-                "-n",
-                namespace,
-                "-o",
-                "jsonpath={.status.conditions[-1].type}",
-            ],
-            capture_output=True,
-            text=True,
+    async def _run() -> dict:
+        client = await Client.connect(temporal_address)
+        handle = await client.start_workflow(
+            TrainRoundWorkflow.run,
+            spec,
+            id=f"train-{kfp_run_id[:8]}-r{fl_round}",
+            task_queue=TASK_QUEUE,
+            # A retried component re-runs this same call with the same
+            # deterministic id. USE_EXISTING is what makes that reattach to a
+            # still-running round's workflow (and hence its result()) instead
+            # of failing with WorkflowAlreadyStartedError -- the default
+            # UNSPECIFIED policy fails fast on a running duplicate ID and
+            # would defeat the whole point of the deterministic id.
+            id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
         )
-        status = result.stdout.strip()
-        print(f"[{attempt * 10}s] PyTorchJob status: {status}")
-        if status == "Succeeded":
-            print("PyTorchJob completed successfully")
-            break
-        if status == "Failed":
-            raise RuntimeError(f"PyTorchJob {job_name} failed")
-    else:
-        raise TimeoutError(f"PyTorchJob {job_name} timed out after 20 minutes")
+        print(f"started Temporal workflow {handle.id}")
+        report = await handle.result()
+        return {
+            "fl_round": report.fl_round,
+            "succeeded": report.succeeded_ids,
+            "failed": report.failed_ids,
+            "results": [vars(r) for r in report.results],
+            "temporal_workflow_id": handle.id,
+        }
 
-    with open(job_status.path, "w") as f:
-        json.dump({"job_name": job_name, "fl_round": fl_round, "status": "Succeeded"}, f)
+    payload = asyncio.run(_run())
+    print(json.dumps(payload, indent=2))
+    with open(worker_report.path, "w") as f:
+        json.dump(payload, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +433,10 @@ def active_fl_pipeline(
     minio_secret_key: str = "minioadmin",
     minio_bucket: str = "active-fed",
     worker_image: str = "active-fed-worker:v1",
+    # Worker orchestration (Temporal)
+    min_workers: int = 2,
+    worker_launcher: str = "temporal",  # "temporal" | "pytorchjob" (removed in P2)
+    temporal_address: str = "temporal-frontend.active-fed.svc.cluster.local:7233",
 ) -> None:
     """Full active-FL pipeline (Active Weight + Active Data) over fl_rounds sequential rounds."""
 
@@ -539,8 +459,12 @@ def active_fl_pipeline(
         train_op = train_workers(
             fl_round=round_idx,
             num_workers=num_workers,
+            min_workers=min_workers,
             local_episodes=local_episodes,
             namespace=namespace,
+            worker_launcher=worker_launcher,
+            temporal_address=temporal_address,
+            kfp_run_id=dsl.PIPELINE_JOB_ID_PLACEHOLDER,
             mlflow_tracking_uri=mlflow_tracking_uri,
             mlflow_experiment_name=mlflow_experiment_name,
             minio_endpoint=minio_endpoint,
@@ -548,37 +472,45 @@ def active_fl_pipeline(
             minio_secret_key=minio_secret_key,
             minio_bucket=minio_bucket,
             worker_image=worker_image,
-        )
+        ).set_retry(num_retries=2, backoff_duration="60s", backoff_factor=2.0)
         if prev_op is not None:
             train_op.after(prev_op)
 
-        agg_op = score_and_aggregate(
-            fl_round=round_idx,
-            num_workers=num_workers,
-            score_threshold=score_threshold,
-            score_temperature=score_temperature,
-            eval_episodes=eval_episodes,
-            minio_endpoint=minio_endpoint,
-            minio_access_key=minio_access_key,
-            minio_secret_key=minio_secret_key,
-            minio_bucket=minio_bucket,
-            active_data_mode=active_data_mode,
-            active_data_threshold=active_data_threshold,
-            active_data_steps=active_data_steps,
-            weight_mode=weight_mode,
-        ).after(train_op)
+        agg_op = (
+            score_and_aggregate(
+                fl_round=round_idx,
+                num_workers=num_workers,
+                score_threshold=score_threshold,
+                score_temperature=score_temperature,
+                eval_episodes=eval_episodes,
+                minio_endpoint=minio_endpoint,
+                minio_access_key=minio_access_key,
+                minio_secret_key=minio_secret_key,
+                minio_bucket=minio_bucket,
+                active_data_mode=active_data_mode,
+                active_data_threshold=active_data_threshold,
+                active_data_steps=active_data_steps,
+                weight_mode=weight_mode,
+            )
+            .after(train_op)
+            .set_retry(num_retries=2, backoff_duration="60s", backoff_factor=2.0)
+        )
 
-        eval_op = evaluate_global(
-            fl_round=round_idx,
-            n_eval_episodes=20,
-            minio_endpoint=minio_endpoint,
-            minio_access_key=minio_access_key,
-            minio_secret_key=minio_secret_key,
-            minio_bucket=minio_bucket,
-            mlflow_tracking_uri=mlflow_tracking_uri,
-            mlflow_experiment_name=mlflow_experiment_name,
-            aggregation_report=agg_op.outputs["aggregation_report"],
-        ).after(agg_op)
+        eval_op = (
+            evaluate_global(
+                fl_round=round_idx,
+                n_eval_episodes=20,
+                minio_endpoint=minio_endpoint,
+                minio_access_key=minio_access_key,
+                minio_secret_key=minio_secret_key,
+                minio_bucket=minio_bucket,
+                mlflow_tracking_uri=mlflow_tracking_uri,
+                mlflow_experiment_name=mlflow_experiment_name,
+                aggregation_report=agg_op.outputs["aggregation_report"],
+            )
+            .after(agg_op)
+            .set_retry(num_retries=2, backoff_duration="60s", backoff_factor=2.0)
+        )
 
         prev_op = eval_op
 
