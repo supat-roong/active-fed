@@ -49,7 +49,7 @@ class _FakeClient:
 def _base_kwargs(worker_report) -> dict:
     return dict(
         fl_round=0, num_workers=2, min_workers=2, local_episodes=5,
-        namespace="ns", worker_launcher="temporal", temporal_address="temporal:7233",
+        namespace="ns", temporal_address="temporal:7233",
         kfp_run_id="abcdef1234", mlflow_tracking_uri="http://mlflow:5000",
         mlflow_experiment_name="exp", minio_endpoint="minio:9000",
         minio_access_key="a", minio_secret_key="b", minio_bucket="bkt",

@@ -19,7 +19,6 @@ training:
 
 # --- Orchestration ---
 orchestration:
-  worker_launcher: temporal      # temporal | pytorchjob (pytorchjob removed in P2)
   temporal_address: temporal-frontend.active-fed.svc.cluster.local:7233
 
 # --- Aggregation Params ---

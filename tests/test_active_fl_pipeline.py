@@ -60,3 +60,42 @@ def test_run_uid_default_is_a_valid_job_name_for_fragment(tmp_path):
     default = spec["root"]["inputDefinitions"]["parameters"]["run_uid"]["defaultValue"]
     assert isinstance(default, str)
     assert _VALID_RUN_ID_FRAGMENT.fullmatch(default[:8]), default
+
+
+# ---------------------------------------------------------------------------
+# P2 task 2: seeded init head + start_round resume + worker_launcher removal
+# ---------------------------------------------------------------------------
+def test_start_round_and_seed_are_pipeline_parameters(tmp_path):
+    text = _compile(tmp_path)
+    spec = yaml.safe_load(text)
+    params = spec["root"]["inputDefinitions"]["parameters"]
+    assert "start_round" in params, sorted(params)
+    assert "seed" in params, sorted(params)
+
+
+def test_worker_launcher_parameter_is_gone(tmp_path):
+    # The Temporal path is now the only path; the pytorchjob migration
+    # fallback and its flag were always meant to be temporary.
+    text = _compile(tmp_path)
+    spec = yaml.safe_load(text)
+    params = spec["root"]["inputDefinitions"]["parameters"]
+    assert "worker_launcher" not in params, "migration flag still present"
+
+
+def test_init_global_model_precedes_the_first_train_workers(tmp_path):
+    # Until init_global_model runs, round 0 has no global model, every worker
+    # keeps its own independently-random ActorCritic, and the aggregator
+    # averages N unrelated networks. The first train_workers task must not be
+    # able to start before the seeded round_0/global.pt is written.
+    text = _compile(tmp_path)
+    spec = yaml.safe_load(text)
+    tasks = spec["root"]["dag"]["tasks"]
+    init_tasks = [k for k in tasks if k.startswith("init-global-model")]
+    assert len(init_tasks) == 1, f"expected exactly one init task, found {init_tasks}"
+    init_task = init_tasks[0]
+
+    first_train = tasks["train-workers"]
+    assert init_task in first_train.get("dependentTasks", []), (
+        f"train-workers must depend on {init_task}, "
+        f"got dependentTasks={first_train.get('dependentTasks')}"
+    )
