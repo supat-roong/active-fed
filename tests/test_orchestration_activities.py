@@ -1,6 +1,15 @@
 from types import SimpleNamespace
 
-from src.orchestration.activities import build_job_manifest, classify_job_status, job_name_for
+import pytest
+from kubernetes.client.exceptions import ApiException
+
+from src.orchestration.activities import (
+    _await_job_deleted,
+    _ensure_job,
+    build_job_manifest,
+    classify_job_status,
+    job_name_for,
+)
 from src.orchestration.types import WorkerSpec
 
 
@@ -33,6 +42,43 @@ def test_job_name_is_a_valid_kubernetes_name():
     assert len(name) <= 63
 
 
+# F4 (gate fix): the KFP deployment in this environment does not substitute
+# dsl.PIPELINE_JOB_ID_PLACEHOLDER before component code runs, so a kfp_run_id
+# of the literal, unsubstituted string "{{$.pipeline_job_uuid}}" previously
+# reached job_name_for verbatim and produced "aflw-{{$.pipe-r0-w0", which the
+# Kubernetes API rejected with a 422 (not a lowercase RFC 1123 subdomain).
+# job_name_for must now reject any run id containing characters that can
+# never appear in a valid Kubernetes name, at the point the name is built,
+# rather than letting a malformed value reach the API and fail there. This is
+# what makes this specific class of bug impossible to reship even if some
+# future caller passes an unsubstituted placeholder or similar garbage again.
+def test_job_name_for_rejects_the_unsubstituted_kfp_placeholder():
+    bad = _spec(kfp_run_id="{{$.pipeline_job_uuid}}")
+    with pytest.raises(ValueError):
+        job_name_for(bad)
+
+
+@pytest.mark.parametrize("bad_char", ["{", "}", "$", "."])
+def test_job_name_for_rejects_each_disallowed_special_character(bad_char):
+    bad = _spec(kfp_run_id=f"ab{bad_char}c1234")
+    with pytest.raises(ValueError):
+        job_name_for(bad)
+
+
+def test_job_name_for_rejects_uppercase():
+    bad = _spec(kfp_run_id="ABCDEF12")
+    with pytest.raises(ValueError):
+        job_name_for(bad)
+
+
+def test_job_name_for_accepts_a_valid_lowercase_alphanumeric_run_id():
+    # Regression guard for the positive path: the rejection above must not
+    # be so strict it also rejects the kind of value run_pipeline.py actually
+    # generates (uuid4().hex[:8] -- lowercase hex).
+    name = job_name_for(_spec(kfp_run_id="a1b2c3d4"))
+    assert name == "aflw-a1b2c3d4-r3-w2"
+
+
 def test_manifest_sets_rank_to_the_worker_id():
     env = {e["name"]: e["value"] for e in
            build_job_manifest(_spec())["spec"]["template"]["spec"]["containers"][0]["env"]}
@@ -53,10 +99,28 @@ def test_manifest_carries_minio_and_mlflow_env():
     assert env["MLFLOW_TRACKING_URI"] == "http://mlflow:5000"
 
 
-def test_manifest_uses_onfailure_restart_policy():
-    # P0 review: restartPolicy Never meant a crashed worker vanished and the
-    # aggregator silently proceeded with N-1 clients.
-    assert build_job_manifest(_spec())["spec"]["template"]["spec"]["restartPolicy"] == "OnFailure"
+def test_manifest_uses_never_restart_policy():
+    # F5 (gate fix): Temporal now owns retry entirely (backoffLimit=0 below),
+    # so an in-place container restart under restartPolicy=OnFailure would be
+    # exactly the per-worker-attribution masking that fix removes -- a
+    # crashed container would come back to life inside the *same* Pod and
+    # Job, silently, before the activity's polling loop ever saw a failure.
+    # With restartPolicy=Never, a crashed container fails the Pod outright,
+    # which (combined with backoffLimit=0 below) fails the Job outright,
+    # which the poll loop below *does* observe as classify_job_status ==
+    # "failed". The earlier P0 concern this replaces (a crashed worker
+    # vanishing and the aggregator silently proceeding with N-1 clients) is
+    # now handled one layer up, by Temporal's own retry/quorum logic instead
+    # of Kubernetes'.
+    assert build_job_manifest(_spec())["spec"]["template"]["spec"]["restartPolicy"] == "Never"
+
+
+def test_manifest_sets_backoff_limit_to_zero():
+    # F5: a non-zero backoffLimit lets the Job controller silently replace a
+    # failed/deleted pod under the Job's own umbrella before Temporal's poll
+    # loop ever notices -- exactly the masking bug the gate found. 0 means
+    # any single pod failure fails the Job immediately.
+    assert build_job_manifest(_spec())["spec"]["backoffLimit"] == 0
 
 
 def test_manifest_labels_identify_round_and_worker():
@@ -108,3 +172,127 @@ def test_classify_job_status_failed_condition_wins_even_when_failed_count_is_low
     # authoritative regardless of the failed-pod count.
     status = _job_status(conditions=[_condition("Failed", "True")], failed=1)
     assert classify_job_status(status, backoff_limit=2) == "failed"
+
+
+# ---------------------------------------------------------------------------
+# F5: _ensure_job / _await_job_deleted — the activity-retry-finds-an-existing-
+# Job branch. Job names are deterministic (job_name_for), so a Temporal
+# activity retry after a real k8s-level failure (backoffLimit=0 now means any
+# pod failure fails the whole Job -- see above) hits `create_namespaced_job`
+# for a name that already exists (409). Fake, in-memory stand-in for
+# kubernetes.client.BatchV1Api -- mirrors the SimpleNamespace-based status
+# fakes above (_job_status/_condition), just stateful enough to script a
+# create -> [409] -> read -> (delete -> poll-until-gone) -> create sequence
+# without a real API server.
+# ---------------------------------------------------------------------------
+class FakeBatchApi:
+    def __init__(self, initial_status=None, reads_until_deleted=0):
+        # initial_status=None means "no Job exists yet". A SimpleNamespace
+        # (as built by _job_status above) means one already exists in that
+        # state, simulating a prior activity attempt's Job still being there.
+        self.status = initial_status
+        self.reads_until_deleted = reads_until_deleted
+        self.calls: list[str] = []
+
+    def create_namespaced_job(self, namespace, body):
+        self.calls.append("create")
+        if self.status is not None:
+            raise ApiException(status=409)
+        self.status = _job_status()  # freshly created: running, no conditions yet
+
+    def read_namespaced_job_status(self, name, namespace):
+        self.calls.append("read")
+        if self.status is None:
+            raise ApiException(status=404)
+        return SimpleNamespace(status=self.status)
+
+    def delete_namespaced_job(self, name, namespace, propagation_policy):
+        self.calls.append(f"delete:{propagation_policy}")
+        # Deletion is async in real Kubernetes -- the object lingers through
+        # `reads_until_deleted` more reads before it actually disappears, so
+        # tests can prove the wait loop actually polls instead of assuming
+        # instant deletion.
+        self._pending = self.reads_until_deleted
+
+    def _tick_pending_delete(self):
+        if self.status is not None and hasattr(self, "_pending"):
+            if self._pending <= 0:
+                self.status = None
+            else:
+                self._pending -= 1
+
+
+class PollingFakeBatchApi(FakeBatchApi):
+    """Like FakeBatchApi, but read_namespaced_job_status ticks the pending
+    deletion countdown on every read, so a deleted Job actually disappears
+    only after `reads_until_deleted` subsequent reads."""
+
+    def read_namespaced_job_status(self, name, namespace):
+        self._tick_pending_delete()
+        return super().read_namespaced_job_status(name, namespace)
+
+
+def _spec_for_ensure_job() -> WorkerSpec:
+    return _spec()
+
+
+def _manifest_for_ensure_job() -> dict:
+    return build_job_manifest(_spec_for_ensure_job())
+
+
+async def test_ensure_job_creates_when_absent():
+    batch = FakeBatchApi(initial_status=None)
+    await _ensure_job(batch, _spec_for_ensure_job(), _manifest_for_ensure_job())
+    assert batch.calls == ["create"]
+    assert batch.status is not None
+
+
+async def test_ensure_job_reattaches_to_a_still_active_existing_job():
+    running = _job_status(conditions=[])
+    batch = FakeBatchApi(initial_status=running)
+    await _ensure_job(batch, _spec_for_ensure_job(), _manifest_for_ensure_job())
+    # Re-attach: exactly one create attempt (which 409s), one status read to
+    # classify it, and critically no delete -- the whole point of this
+    # branch is to leave a genuinely still-running Job alone.
+    assert batch.calls == ["create", "read"]
+    assert batch.status is running
+
+
+async def test_ensure_job_deletes_and_recreates_a_terminally_failed_job():
+    # reads_until_deleted=0: the deletion is reported gone on the very first
+    # poll, so this test exercises the create->read->delete->await->create
+    # sequencing without sleeping on _ensure_job's real (multi-second)
+    # production poll interval. The wait loop's actual multi-poll behavior
+    # (proving it doesn't assume instant deletion) is covered directly by
+    # test_await_job_deleted_returns_once_the_job_404s below, with a
+    # deliberately tiny poll_s.
+    failed = _job_status(conditions=[_condition("Failed", "True")])
+    batch = PollingFakeBatchApi(initial_status=failed, reads_until_deleted=0)
+    await _ensure_job(batch, _spec_for_ensure_job(), _manifest_for_ensure_job())
+    # create (409) -> read (classify as failed) -> delete -> poll reads until
+    # gone -> create again. The deletion must fully complete (status becomes
+    # None) strictly before the second create, or this would race a
+    # half-deleted Job.
+    assert batch.calls[0] == "create"
+    assert batch.calls[1] == "read"
+    assert batch.calls[2] == "delete:Background"
+    assert batch.calls.count("create") == 2
+    first_delete_idx = batch.calls.index("delete:Background")
+    second_create_idx = len(batch.calls) - 1 - batch.calls[::-1].index("create")
+    assert second_create_idx > first_delete_idx
+    # At least one poll read happened between delete and the recreate.
+    assert batch.calls[first_delete_idx + 1 : second_create_idx].count("read") >= 1
+
+
+async def test_await_job_deleted_returns_once_the_job_404s():
+    batch = PollingFakeBatchApi(initial_status=_job_status(), reads_until_deleted=1)
+    batch.delete_namespaced_job(name="x", namespace="ns", propagation_policy="Background")
+    await _await_job_deleted(batch, "ns", "x", timeout_s=5, poll_s=0.01)
+    assert batch.status is None
+
+
+async def test_await_job_deleted_raises_on_timeout_instead_of_hanging():
+    batch = PollingFakeBatchApi(initial_status=_job_status(), reads_until_deleted=10_000)
+    batch.delete_namespaced_job(name="x", namespace="ns", propagation_policy="Background")
+    with pytest.raises(TimeoutError):
+        await _await_job_deleted(batch, "ns", "x", timeout_s=0.05, poll_s=0.01)

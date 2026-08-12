@@ -239,7 +239,8 @@ about which one to open for a given question.
 ### Reading per-worker progress in Temporal
 
 Each FL round starts one `TrainRoundWorkflow` (workflow ID `train-<8hex>-r<round>`, where
-`<8hex>` is the first 8 characters of the KFP run ID) that fans out one `WorkerWorkflow` child
+`<8hex>` is the first 8 characters of `run_uid` — an id `run_pipeline.py` generates itself
+per submitted run, not a value read from KFP) that fans out one `WorkerWorkflow` child
 per worker (`train-<8hex>-r<round>-w<worker>`). In the Temporal UI:
 
 1. Open the `TrainRoundWorkflow` for the round you care about — it lists `N` `WorkerWorkflow`
@@ -253,13 +254,15 @@ per worker (`train-<8hex>-r<round>-w<worker>`). In the Temporal UI:
 3. If the *activity code itself* fails or times out (e.g. an unrecoverable Kubernetes API
    error, or the pod-watch timeout), that `WorkerWorkflow` shows the retry attempt and the
    *root-cause* failure message for that worker specifically, not a generic whole-fleet error.
-   **Known limitation:** if only the worker's *pod* is lost (killed, evicted, node drain) while
-   its Job still has budget left, Kubernetes' own Job controller silently replaces the pod
-   before the 5-second poll notices anything — the `WorkerWorkflow` then reports a clean
-   success with no visible retry, even though a different pod actually did the work. Per-pod
-   attribution is therefore only as good as what the Job object itself reports; check
-   `kubectl get pods -n active-fed -l app=active-fl-worker` directly if you need to know
-   whether a specific pod was replaced mid-round.
+   Temporal owns retry entirely: each worker Job runs with `backoffLimit: 0` and
+   `restartPolicy: Never`, so a lost pod (killed, evicted, node drain) fails the Job immediately
+   instead of being silently replaced under Kubernetes' own Job-level self-healing. A retried
+   activity finds that failed Job (Job names are deterministic), deletes it, waits for the
+   deletion to complete, and creates a fresh one — so the `WorkerWorkflow`'s retry attempt and
+   root-cause message reflect that specific pod's failure, not a mid-round replacement Kubernetes
+   made on its own. (This replaces an earlier gate finding where a force-killed pod was absorbed
+   by Kubernetes' Job controller before the 5-second poll ever saw it — see
+   `.superpowers/sdd/2026-08-12-p1-temporal-orchestration/gate-fixes-report.md`, F5.)
 4. The underlying Kubernetes Job for each worker is named deterministically:
    `aflw-<8hex>-r<round>-w<worker>` — one Job per (round, worker), safe to re-attach to on
    retry instead of racing a second Job onto the same MinIO keys.

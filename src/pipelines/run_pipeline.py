@@ -129,6 +129,14 @@ def main():
         import uuid
 
         bucket_name = f"fed-{uuid.uuid4().hex[:12]}"
+        # F4 (gate fix): generated here instead of relying on KFP's
+        # dsl.PIPELINE_JOB_ID_PLACEHOLDER, which this KFP deployment never
+        # substitutes before component code runs (it arrives literally as
+        # "{{$.pipeline_job_uuid}}", which is not a valid Kubernetes name
+        # fragment). uuid4().hex is already lowercase hex, so this is
+        # RFC-1123-safe by construction and stable for the lifetime of this
+        # run, same as bucket_name above.
+        run_uid = uuid.uuid4().hex[:8]
 
         arguments = {
             "num_workers": workers,
@@ -145,6 +153,7 @@ def main():
             "minio_bucket": bucket_name,
             "worker_launcher": worker_launcher,
             "temporal_address": temporal_address,
+            "run_uid": run_uid,
         }
 
         run = client.create_run_from_pipeline_package(

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 from temporalio import activity
@@ -24,6 +25,11 @@ POD_WATCH_TIMEOUT_S = 3600
 # How often to poll pod state and emit a heartbeat.
 POLL_INTERVAL_S = 5
 
+# A Kubernetes object name segment: RFC-1123 lowercase alphanumerics and '-'.
+# kfp_run_id is truncated to 8 chars before use, so this only needs to accept
+# that fragment, not a full name.
+_VALID_RUN_ID_FRAGMENT = re.compile(r"[a-z0-9]+")
+
 
 def job_name_for(spec: WorkerSpec) -> str:
     """Deterministic Job name.
@@ -31,8 +37,26 @@ def job_name_for(spec: WorkerSpec) -> str:
     Deterministic on purpose: a retried activity must re-attach to the existing
     Job rather than launch a second fleet. The previous implementation embedded
     uuid4() and raced 2N workers onto the same MinIO keys on retry.
+
+    F4 (gate fix): validates the run-id fragment before building the name.
+    A KFP deployment that never substitutes dsl.PIPELINE_JOB_ID_PLACEHOLDER
+    previously let the literal string "{{$.pipeline_job_uuid}}" flow straight
+    through into this f-string, producing "aflw-{{$.pipe-r0-w0" -- a name
+    Kubernetes' own API rejects outright (422, not a lowercase RFC 1123
+    subdomain), but only after a Job create call, and identically on every one
+    of Temporal's retries. Rejecting `{`, `}`, `$`, `.` and uppercase here,
+    synchronously and before any I/O, turns that into an immediate, clear
+    ValueError at the one place this value is turned into a Kubernetes name.
     """
-    return f"aflw-{spec.kfp_run_id[:8]}-r{spec.fl_round}-w{spec.worker_id}"
+    fragment = spec.kfp_run_id[:8]
+    if not _VALID_RUN_ID_FRAGMENT.fullmatch(fragment):
+        raise ValueError(
+            f"kfp_run_id must be lowercase alphanumeric to form a valid Kubernetes "
+            f"name; got {spec.kfp_run_id!r} (an unsubstituted KFP placeholder like "
+            f"'{{{{$.pipeline_job_uuid}}}}' looks like this -- pass an explicit "
+            f"run_uid instead of dsl.PIPELINE_JOB_ID_PLACEHOLDER)"
+        )
+    return f"aflw-{fragment}-r{spec.fl_round}-w{spec.worker_id}"
 
 
 def build_job_manifest(spec: WorkerSpec) -> dict:
@@ -51,7 +75,16 @@ def build_job_manifest(spec: WorkerSpec) -> dict:
             },
         },
         "spec": {
-            "backoffLimit": 2,
+            # F5 (gate fix): Temporal owns retry entirely now. A non-zero
+            # backoffLimit let the Job controller replace a failed/deleted
+            # pod under its own umbrella -- e.g. `kubectl delete pod --force`
+            # on a real cluster produced a same-Job replacement pod within a
+            # second, and the whole round reported succeeded/attempts=1 with
+            # zero trace of the kill. backoffLimit=0 means a single pod
+            # failure fails the Job immediately instead of being silently
+            # absorbed, so launch_and_watch_pod's Job-level poll (the only
+            # vantage point it has) actually observes it.
+            "backoffLimit": 0,
             "ttlSecondsAfterFinished": 3600,
             "template": {
                 "metadata": {
@@ -62,7 +95,15 @@ def build_job_manifest(spec: WorkerSpec) -> dict:
                     }
                 },
                 "spec": {
-                    "restartPolicy": "OnFailure",
+                    # Never, not OnFailure: with Temporal owning retry,
+                    # restarting the container in place (OnFailure) would be
+                    # exactly the same masking as the backoffLimit issue
+                    # above, just one layer lower -- the crashed container
+                    # comes back inside the same Pod/Job before the poll loop
+                    # ever sees a gap. Never means a crashed container fails
+                    # the Pod outright, which (with backoffLimit=0) fails the
+                    # Job outright and is observed.
+                    "restartPolicy": "Never",
                     "containers": [
                         {
                             "name": "worker",
@@ -138,6 +179,92 @@ def _k8s_batch_and_core():
     return client.BatchV1Api(), client.CoreV1Api()
 
 
+# How long to wait for a stale, terminally-failed Job to finish deleting
+# before recreating it, and how often to poll while waiting.
+JOB_DELETE_TIMEOUT_S = 60
+JOB_DELETE_POLL_S = 2
+
+
+async def _ensure_job(batch, spec: WorkerSpec, manifest: dict) -> None:
+    """Create the worker Job, handling the case where it already exists.
+
+    Job names are deterministic (job_name_for), so a Temporal *activity*
+    retry re-runs this against a name that may already be sitting in the
+    cluster from the previous attempt. Two distinct cases (F5, the gate's
+    most important finding):
+
+    - The existing Job is still active (or already succeeded): re-attach, as
+      before -- do nothing further here and let the watch loop below observe
+      its current/eventual state.
+    - The existing Job is terminally Failed: with Temporal now owning retry
+      (backoffLimit=0), a Failed Job here is exactly what a previous, real
+      failure left behind. `create_namespaced_job` cannot resurrect it (still
+      409s), and simply re-attaching would make the watch loop observe an
+      already-Failed object forever, so the retry would fail instantly and
+      permanently instead of actually retrying. It must be deleted and
+      recreated -- and deleted *and confirmed gone* before recreating, or the
+      create races a half-deleted object (a spurious 409, or orphaned pods
+      from the old generation attaching to the new Job via a stale label
+      selector timing window).
+    """
+    from kubernetes.client.exceptions import ApiException
+
+    name = manifest["metadata"]["name"]
+    namespace = spec.namespace
+
+    try:
+        batch.create_namespaced_job(namespace=namespace, body=manifest)
+        activity.logger.info(f"created Job {name}")
+        return
+    except ApiException as e:
+        if e.status != 409:  # 409 = already exists
+            raise
+
+    existing = batch.read_namespaced_job_status(name=name, namespace=namespace)
+    outcome = classify_job_status(existing.status, manifest["spec"]["backoffLimit"])
+    if outcome != "failed":
+        activity.logger.info(f"Job {name} already exists, re-attaching")
+        return
+
+    activity.logger.info(f"Job {name} exists but is terminally failed; deleting and recreating")
+    batch.delete_namespaced_job(name=name, namespace=namespace, propagation_policy="Background")
+    await _await_job_deleted(
+        batch, namespace, name, timeout_s=JOB_DELETE_TIMEOUT_S, poll_s=JOB_DELETE_POLL_S
+    )
+    batch.create_namespaced_job(namespace=namespace, body=manifest)
+    activity.logger.info(f"recreated Job {name} after clearing the failed attempt")
+
+
+async def _await_job_deleted(
+    batch, namespace: str, name: str, timeout_s: float, poll_s: float
+) -> None:
+    """Block until a deleted Job (and, via cascade, its pods) is fully gone.
+
+    Background propagation returns as soon as the delete is *accepted*, not
+    once the object and its pods are actually removed -- recreating
+    immediately would race that in-flight deletion. Polls
+    read_namespaced_job_status until it 404s; raises TimeoutError rather than
+    looping forever if deletion is somehow wedged, so a stuck cluster fails
+    the activity (and gets retried/surfaced) instead of hanging it.
+    """
+    from kubernetes.client.exceptions import ApiException
+
+    waited = 0.0
+    while True:
+        try:
+            batch.read_namespaced_job_status(name=name, namespace=namespace)
+        except ApiException as e:
+            if e.status == 404:
+                return
+            raise
+        if waited >= timeout_s:
+            raise TimeoutError(
+                f"Job {name} in {namespace} did not finish deleting within {timeout_s}s"
+            )
+        await asyncio.sleep(poll_s)
+        waited += poll_s
+
+
 @activity.defn
 async def launch_and_watch_pod(spec: WorkerSpec) -> WorkerResult:
     """Create the worker Job if absent, then watch it to completion.
@@ -151,13 +278,7 @@ async def launch_and_watch_pod(spec: WorkerSpec) -> WorkerResult:
     name = job_name_for(spec)
     manifest = build_job_manifest(spec)
 
-    try:
-        batch.create_namespaced_job(namespace=spec.namespace, body=manifest)
-        activity.logger.info(f"created Job {name}")
-    except ApiException as e:
-        if e.status != 409:  # 409 = already exists; retry re-attaches
-            raise
-        activity.logger.info(f"Job {name} already exists, re-attaching")
+    await _ensure_job(batch, spec, manifest)
 
     waited = 0
     while waited < POD_WATCH_TIMEOUT_S:
@@ -201,11 +322,23 @@ async def launch_and_watch_pod(spec: WorkerSpec) -> WorkerResult:
 async def _attempt_count(core, spec: WorkerSpec, job_name: str) -> int:
     """Container attempts (restarts + 1) for the job's pod.
 
-    Chosen over `status.failed`/`status.succeeded`: under `restartPolicy:
-    OnFailure`, Kubernetes restarts the *container* in place rather than
-    replacing the Pod, so those Job-level counters count Pods, not attempts,
-    and cannot report the retry count they were previously assumed to give.
-    `containerStatuses[0].restartCount` is the accurate source.
+    Chosen over `status.failed`/`status.succeeded`: under the old
+    `restartPolicy: OnFailure`, Kubernetes restarted the *container* in place
+    rather than replacing the Pod, so those Job-level counters counted Pods,
+    not attempts, and could not report the retry count they were previously
+    assumed to give. `containerStatuses[0].restartCount` was the accurate
+    source for that in-place-restart world.
+
+    F5 note: since restartPolicy is now `Never` with `backoffLimit: 0` (see
+    build_job_manifest), a Job's pod is never restarted in place, so this
+    will normally read 0 (-> return 1) for whichever Job generation is
+    currently live -- Kubernetes no longer retries at all. The authoritative
+    per-worker retry count now lives one layer up, in Temporal's own activity
+    attempt number (`activity.info().attempt`), across the delete+recreate
+    cycle in `_ensure_job`. This function still answers a real, distinct
+    question (how many times did *this* container attempt run, which is
+    always 0-or-1 now) but is no longer the retry-count signal; left as-is,
+    out of scope for this fix.
     """
     try:
         pods = core.list_namespaced_pod(
