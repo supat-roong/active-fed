@@ -46,15 +46,21 @@ def main():
     t = cfg.get("training", {})
     agg = cfg.get("aggregation", {})
     exp = cfg.get("experiment", {})
+    orch = cfg.get("orchestration", {})
 
     fl_rounds = t.get("fl_rounds", 10)
     workers = t.get("num_workers", 4)
+    min_workers = t.get("min_workers", 2)
     episodes = t.get("local_episodes", 200)
     score_threshold = agg.get("score_threshold", 0.0)
     eval_episodes = t.get("eval_episodes", 10)
     score_temperature = agg.get("score_temperature", 1.0)
     active_data_threshold = agg.get("active_data_threshold", 0.0)
     active_data_steps = agg.get("active_data_steps", 3)
+    worker_launcher = orch.get("worker_launcher", "temporal")
+    temporal_address = orch.get(
+        "temporal_address", "temporal-frontend.active-fed.svc.cluster.local:7233"
+    )
 
     combos = cfg.get("combinations", [{"weight_mode": "active", "active_data_mode": "bc"}])
 
@@ -126,6 +132,7 @@ def main():
 
         arguments = {
             "num_workers": workers,
+            "min_workers": min_workers,
             "local_episodes": episodes,
             "eval_episodes": eval_episodes,
             "score_threshold": score_threshold,
@@ -136,6 +143,8 @@ def main():
             "weight_mode": weight_mode,
             "mlflow_experiment_name": run_name,
             "minio_bucket": bucket_name,
+            "worker_launcher": worker_launcher,
+            "temporal_address": temporal_address,
         }
 
         run = client.create_run_from_pipeline_package(
