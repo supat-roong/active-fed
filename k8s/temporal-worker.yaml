@@ -1,3 +1,10 @@
+# Not renamed (F2 gate fix): unlike the Deployment below, this ServiceAccount
+# does not collide with anything the Temporal Helm chart creates -- verified
+# live against the chart's own rendered manifest (`helm get manifest
+# temporal`), every chart-owned pod uses `serviceAccountName: default`, and
+# the chart defines no ServiceAccount object at all. Kept as "temporal-worker"
+# so the ClusterRoleBinding subject and `serviceAccountName` reference below
+# don't need to change.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -20,19 +27,28 @@ roleRef:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: temporal-worker
+  # F2 (gate fix): "temporal-worker" is also the name the Temporal Helm
+  # chart uses for its own internal system-workflow worker role (server-side
+  # frontend/history/matching/worker), deployed into this same namespace.
+  # Deployment.spec.selector is immutable, so `kubectl apply` on this
+  # manifest under the old shared name failed outright trying to overwrite
+  # the chart's own object with a mismatched selector -- this repo's actual
+  # orchestration worker (the one polling the active-fed Temporal task
+  # queue) was never deployed as a result. Renamed to something the chart
+  # cannot ever also produce.
+  name: active-fl-temporal-worker
   namespace: active-fed
   labels:
-    app: temporal-worker
+    app: active-fl-temporal-worker
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: temporal-worker
+      app: active-fl-temporal-worker
   template:
     metadata:
       labels:
-        app: temporal-worker
+        app: active-fl-temporal-worker
     spec:
       serviceAccountName: temporal-worker
       containers:
