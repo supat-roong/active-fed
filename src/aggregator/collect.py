@@ -13,6 +13,7 @@ import logging
 
 import torch
 from minio import Minio
+from minio.error import S3Error
 
 from src.aggregator.scorer import ClientUpdate
 
@@ -91,6 +92,43 @@ def push_global_weights(
     buf.seek(0)
     minio_client.put_object(bucket, key, buf, length=buf.getbuffer().nbytes)
     log.info(f"Pushed global weights → MinIO: {key}")
+    return key
+
+
+def write_initial_global_weights(
+    minio_client: Minio,
+    bucket: str,
+    seed: int = 42,
+) -> str:
+    """Write a single seeded round-0 global model, if one is not already there.
+
+    Without this, round 0 has no global model, every worker falls back to its
+    own independently-random ActorCritic, and the aggregator averages N
+    unrelated networks. The local runner never had this bug because it builds
+    one model and pushes it to every worker; only the K8s path diverged.
+
+    Idempotent: an existing round_0/global.pt is left untouched, so a retried
+    pipeline head cannot reset training.
+    """
+    key = "round_0/global.pt"
+    try:
+        minio_client.stat_object(bucket, key)
+        log.info(f"initial global weights already present at {key}, leaving them alone")
+        return key
+    except S3Error as e:
+        if e.code not in ("NoSuchKey", "NoSuchObject"):
+            raise
+
+    from src.agent.model import ActorCritic
+
+    torch.manual_seed(seed)
+    weights = {k: v.clone() for k, v in ActorCritic().state_dict().items()}
+
+    buf = io.BytesIO()
+    torch.save(weights, buf)
+    buf.seek(0)
+    minio_client.put_object(bucket, key, buf, length=buf.getbuffer().nbytes)
+    log.info(f"wrote seeded initial global weights (seed={seed}) → {key}")
     return key
 
 

@@ -153,6 +153,11 @@ def train(args: argparse.Namespace) -> None:
         )
 
         # -- Agent setup --
+        # Deterministic fallback. round_0/global.pt is written by the pipeline's
+        # init_global_model step, so reaching the None branch below means that
+        # step did not run — seed anyway so the failure is reproducible rather
+        # than a different random net per worker.
+        torch.manual_seed(args.seed + worker_id)
         agent = PPOAgent(device=args.device)
 
         # -- Fetch global weights (if available) --
@@ -162,6 +167,13 @@ def train(args: argparse.Namespace) -> None:
             global_weights = _fetch_global_weights(minio_client, bucket, args.fl_round)
             if global_weights is not None:
                 agent.set_weights(global_weights)
+            else:
+                log.warning(
+                    f"no global weights for round {args.fl_round}; worker {worker_id} is "
+                    "starting from a locally-seeded model. If this appears at round 0 the "
+                    "init_global_model step did not run and aggregation will average "
+                    "unrelated networks."
+                )
         else:
             log.info("DRY RUN: skipping MinIO, using fresh model")
             global_weights = None
@@ -281,6 +293,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cpu", help="Torch device (cpu or cuda)")
     p.add_argument("--mlflow-tracking-uri", type=str, default="http://localhost:5000")
     p.add_argument("--dry-run", action="store_true", help="Skip MinIO; useful for local testing")
+    p.add_argument(
+        "--seed", type=int, default=42, help="Seed for the deterministic fallback model init"
+    )
     return p.parse_args()
 
 
