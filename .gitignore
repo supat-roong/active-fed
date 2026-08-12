@@ -72,3 +72,6 @@ Thumbs.db
 *.swo
 *~
 .ruff_cache/
+
+# Superpowers SDD scratch (ledger, briefs, review packages)
+.superpowers/
