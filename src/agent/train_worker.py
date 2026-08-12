@@ -1,5 +1,8 @@
 """
-Worker entrypoint for Kubeflow PyTorchJob pods.
+Worker entrypoint, launched as a plain Kubernetes batch/v1 Job (not a
+PyTorchJob -- there is no PyTorchJob CRD anywhere in this path). A Temporal
+activity (launch_and_watch_pod in src/orchestration/activities.py) builds the
+Job manifest and creates it directly against the Kubernetes API.
 
 Each worker:
 1. Fetches the current global model from MinIO
@@ -15,7 +18,9 @@ Environment variables expected:
   MINIO_ACCESS_KEY
   MINIO_SECRET_KEY
   MINIO_BUCKET          - default: active-fed
-  WORKER_ID             - injected by PyTorchJob as RANK
+  RANK                  - this worker's id; set explicitly per Job by
+                          build_job_manifest (src/orchestration/activities.py),
+                          one Job per worker. Falls back to --worker-id if unset.
 """
 
 from __future__ import annotations
