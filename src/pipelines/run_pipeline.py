@@ -48,6 +48,42 @@ def run_step(argv: list[str], description: str) -> None:
     subprocess.run(argv, check=True)
 
 
+def wait_for_runs(client, submitted_runs: list[tuple[str, str]], timeout: int) -> list[str]:
+    """Wait for every submitted KFP run to finish; collect the ones that failed.
+
+    One run failing or timing out must not stop the loop from waiting on the
+    rest -- each run is awaited regardless of prior outcomes, same per-run
+    logging as before. Unlike the previous version of this loop, a failure is
+    also collected and returned (not just logged) so the caller can turn it
+    into a non-zero exit instead of silently reporting success.
+    """
+    failures: list[str] = []
+    for run_id, run_name in submitted_runs:
+        try:
+            log.info(f"Waiting on {run_name} (ID: {run_id})...")
+            res = client.wait_for_run_completion(run_id=run_id, timeout=timeout)
+            log.info(f"✅ {run_name} completed with status: {res.state}")
+        except Exception as e:
+            log.error(f"❌ {run_name} failed or timed out: {e}")
+            failures.append(f"pipeline run {run_name} (ID {run_id}) failed or timed out: {e}")
+    return failures
+
+
+def report_failures_and_exit(failures: list[str]) -> None:
+    """Log every collected failure, then exit non-zero if there were any.
+
+    Single audit point shared by run-wait failures and post-processing
+    failures: whichever stage a failure came from, landing in this list is
+    what decides the process's exit code -- the process must never claim
+    success while any failure was collected.
+    """
+    if failures:
+        log.error("failed for %d step(s):", len(failures))
+        for f in failures:
+            log.error("  %s", f)
+        raise SystemExit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Submit Active-FL pipeline")
     parser.add_argument("--config", default="config/k8s.yaml", help="Path to config YAML file")
@@ -249,18 +285,17 @@ def main():
     if args.wait:
         log.info("=================================================")
         log.info(f"Waiting for {len(submitted_runs)} runs to complete...")
-        for run_id, run_name in submitted_runs:
-            try:
-                log.info(f"Waiting on {run_name} (ID: {run_id})...")
-                res = client.wait_for_run_completion(run_id=run_id, timeout=args.timeout)
-                log.info(f"✅ {run_name} completed with status: {res.state}")
-            except Exception as e:
-                log.error(f"❌ {run_name} failed or timed out: {e}")
+        # F3 (gate fix): previously this loop only logged a failed/timed-out
+        # run and kept going -- main() still exited 0 even if every run
+        # failed. wait_for_runs collects failures instead of just logging
+        # them, and they now feed into the same failures list post-processing
+        # already uses, so one combined check at the end decides the exit
+        # code honestly.
+        failures = wait_for_runs(client, submitted_runs, timeout=args.timeout)
 
         if args.auto_download:
             log.info("=================================================")
             log.info("Auto-downloading results from MLflow...")
-            failures: list[str] = []
             for _, run_name in submitted_runs:
                 try:
                     run_step(
@@ -296,11 +331,7 @@ def main():
             except Exception as e:
                 failures.append(f"generate plots: {e}")
 
-            if failures:
-                log.error("post-processing failed for %d step(s):", len(failures))
-                for f in failures:
-                    log.error("  %s", f)
-                raise SystemExit(1)
+        report_failures_and_exit(failures)
 
 
 if __name__ == "__main__":
