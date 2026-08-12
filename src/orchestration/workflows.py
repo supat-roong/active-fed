@@ -123,7 +123,7 @@ class TrainRoundWorkflow:
                 )
             except Exception as e:
                 self._statuses[worker_id] = WorkerStatus(
-                    worker_id=worker_id, phase="Failed", message=str(e)
+                    worker_id=worker_id, phase="Failed", message=_root_cause_message(e)
                 )
                 raise
             self._statuses[worker_id] = WorkerStatus(

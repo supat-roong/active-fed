@@ -211,6 +211,33 @@ async def test_round_status_query_reports_populated_map():
 
 
 @pytest.mark.asyncio
+async def test_live_status_query_reports_root_cause_for_failed_worker():
+    @activity.defn(name="launch_and_watch_pod")
+    async def launch(spec: WorkerSpec) -> WorkerResult:
+        if spec.worker_id == 1:
+            raise RuntimeError("pod OOMKilled")
+        return _ok(spec)
+
+    @activity.defn(name="cleanup_worker_job")
+    async def cleanup(spec: WorkerSpec) -> None:
+        return None
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE,
+            workflows=[TrainRoundWorkflow, WorkerWorkflow], activities=[launch, cleanup],
+        ):
+            handle = await env.client.start_workflow(
+                TrainRoundWorkflow.run, _round_spec(min_workers=2),
+                id=f"t-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            await handle.result()
+            statuses = await handle.query(TrainRoundWorkflow.status)
+    assert "OOMKilled" in statuses[1].message
+    assert statuses[1].message != "Child Workflow execution failed"
+
+
+@pytest.mark.asyncio
 async def test_gather_exception_reports_root_cause_not_generic_wrapper():
     @activity.defn(name="launch_and_watch_pod")
     async def launch(spec: WorkerSpec) -> WorkerResult:
