@@ -8,6 +8,19 @@
 
 **Tech Stack:** Existing plus Karmada v1.17.0 (`karmadactl`), and the Karmada aggregated API for best-effort pod introspection.
 
+## Scope re-verified against the post-P2 tree (2026-08-18)
+
+Checked before execution, because this plan was written before P1 and P2 landed and P2's plan had already drifted:
+
+- `launch_and_watch_pod`, `_ensure_job` and `collect_worker_updates` all exist as assumed.
+- **`launch_and_watch_pod` now RAISES `WorkerJobFailed` on failure rather than returning `WorkerResult(succeeded=False)`.** This was P1's final fix — Temporal retries on exceptions only, so returning made `RetryPolicy(maximum_attempts=3)` dead. Task 4's MinIO-completion path **must preserve the raise**; converting it back to a return would silently disable retry again.
+- `build_job_manifest` ships `backoffLimit: 0` with `restartPolicy: Never` so Temporal owns retry exclusively. **Do not change either.**
+- `WorkerSpec`/`RoundSpec` do not yet carry `topology`/`member_cluster` — Task 3 adds them as planned.
+- `fed-twin/setup/install_multi_cluster_local.sh` already sources `vendor/fed-infra` and calls `fed_mlflow_install` (a P0 final-review fix). Task 6 builds on that; do not revert it.
+- `fed-infra` has no `karmada` component, no multi-cluster kind templates, and `fed_up` is single-profile only — all as this plan assumes.
+
+**Environment caveat:** the colima VM currently reports ~5.8 GiB, not the 9.7 GiB assumed when this plan was written. Eight concurrent workers already OOM-killed one during P2's gate. Task 7 needs host + members; restore VM memory or cap `FED_MEMBER_COUNT` at 1 before attempting it. Tasks 1-6 need no cluster.
+
 ## Global Constraints
 
 - **Prerequisite:** Phases P0–P2 complete and gated. Temporal owns the fleet; round-0 init and `start_round` resume are in place.
