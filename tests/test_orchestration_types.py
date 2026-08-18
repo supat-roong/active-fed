@@ -87,6 +87,43 @@ def test_worker_spec_inherits_round_topology():
 
 
 # ---------------------------------------------------------------------------
+# P3 multi-endpoints fix: minio_nodeport/mlflow_nodeport. Only meaningful
+# under topology="multi" (see src/orchestration/activities.py's endpoint
+# rewrite, which reads them off the WorkerSpec it dispatches), but carried on
+# both RoundSpec and WorkerSpec the same way member_count/member_prefix
+# already are, so worker_spec() threads them through unchanged just like every
+# other RoundSpec-driving field.
+# ---------------------------------------------------------------------------
+
+
+def test_worker_spec_defaults_nodeports_to_zero():
+    spec = WorkerSpec(
+        fl_round=0, worker_id=0, num_workers=1, local_episodes=1,
+        namespace="ns", worker_image="img:v1", minio_endpoint="m:9000",
+        minio_access_key="a", minio_secret_key="b", minio_bucket="bkt",
+        mlflow_tracking_uri="http://mlflow:5000", mlflow_experiment_name="exp",
+        kfp_run_id="run-1",
+    )
+    assert spec.minio_nodeport == 0
+    assert spec.mlflow_nodeport == 0
+
+
+def test_round_spec_defaults_nodeports_to_zero():
+    spec = _round_spec()
+    assert spec.minio_nodeport == 0
+    assert spec.mlflow_nodeport == 0
+
+
+def test_round_spec_threads_nodeports_into_worker_spec():
+    spec = _round_spec(
+        topology="multi", member_count=2, member_prefix="active-fed-member",
+        minio_nodeport=30900, mlflow_nodeport=30500,
+    ).worker_spec(0)
+    assert spec.minio_nodeport == 30900
+    assert spec.mlflow_nodeport == 30500
+
+
+# ---------------------------------------------------------------------------
 # Round-robin worker -> member assignment (Task 5). Task 3 deliberately left
 # RoundSpec.worker_spec() passing a single static member_cluster straight
 # through to every worker; member_count/member_prefix (added here) let it

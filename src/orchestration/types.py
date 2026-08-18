@@ -58,6 +58,23 @@ class WorkerSpec:
     # policy raise rather than let this default silently fan a worker out to
     # every member.
     member_cluster: str = ""
+    # NodePorts exposing the host cluster's MinIO/MLflow Services, only
+    # meaningful when topology == "multi": a member-cluster pod cannot resolve
+    # minio_endpoint/mlflow_tracking_uri's in-cluster DNS names (they belong to
+    # the host cluster's own internal DNS, unreachable from a separate
+    # cluster), but every kind cluster in this project's multi-cluster
+    # environment shares one Docker bridge network, so a member pod can reach
+    # the host's NodePorts via the host's node IP. activities.py's dispatch-
+    # time rewrite (_rewrite_endpoints_for_multi) reads these two fields off
+    # the WorkerSpec it is about to dispatch and rewrites minio_endpoint/
+    # mlflow_tracking_uri to "<host-node-ip>:<nodeport>" before
+    # build_job_manifest ever sees the spec. Left as plain ints with a 0
+    # default (not validated here, unlike member_count/member_prefix above):
+    # topology="single" never reads them at all, and the rewrite itself -- the
+    # only code that does read them for topology="multi" -- is exactly where
+    # a misconfigured (zero) value is caught and raised on, next to the value.
+    minio_nodeport: int = 0
+    mlflow_nodeport: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -89,6 +106,13 @@ class RoundSpec:
     # worker instead.
     member_count: int = 0
     member_prefix: str = ""
+    # NodePorts exposing the host cluster's MinIO/MLflow Services to Karmada
+    # member clusters. See WorkerSpec.minio_nodeport/mlflow_nodeport above for
+    # why these exist and where they're actually consumed; worker_spec() below
+    # just threads them through unchanged, the same as every other
+    # RoundSpec-driving field.
+    minio_nodeport: int = 0
+    mlflow_nodeport: int = 0
 
     def worker_spec(self, worker_id: int) -> WorkerSpec:
         member_cluster = self.member_cluster
@@ -110,6 +134,8 @@ class RoundSpec:
             kfp_run_id=self.kfp_run_id,
             topology=self.topology,
             member_cluster=member_cluster,
+            minio_nodeport=self.minio_nodeport,
+            mlflow_nodeport=self.mlflow_nodeport,
         )
 
     def _member_cluster_for(self, worker_id: int) -> str:
