@@ -1,19 +1,24 @@
 """
 Phase P4 Task 2: MLflow cross-link tags.
 
-Covers `log_run_context` (src/tracking/mlflow_logger.py) in isolation: the
-function that tags an active MLflow run with `kfp_run_id`, `kfp_run_url`,
-`temporal_workflow_id`, `temporal_workflow_url` and `topology`, so the four
-observability surfaces (KFP, Temporal, MLflow, Kubernetes Dashboard) can be
-navigated between instead of correlated by hand across three UIs by
-timestamp.
+Covers `log_run_context` (src/tracking/mlflow_logger.py) in isolation, and its
+wiring into `evaluate_global` (src/pipelines/active_fl_pipeline.py), which
+reads the `temporal_workflow_id` that `train_workers` writes into the
+`worker_report` artifact -- investigated and confirmed present in both the
+success and quorum-failure payloads (see train_workers in
+active_fl_pipeline.py and tests/test_train_workers_component.py) -- and opens
+one MLflow run per round that these tags attach to.
 """
 
 from __future__ import annotations
 
+import io
+import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from src.tracking.mlflow_logger import log_run_context
 
@@ -113,3 +118,157 @@ def test_topology_tag_correct_under_both_topologies(mock_mlflow, topology):
     log_run_context(kfp_run_id="run-1", temporal_workflow_id="wf-1", topology=topology)
     tags = mock_mlflow.set_tags.call_args.args[0]
     assert tags["topology"] == topology
+
+
+# ---------------------------------------------------------------------------
+# Wiring into evaluate_global: it must read temporal_workflow_id out of the
+# worker_report artifact (written by train_workers) and pass it, together
+# with kfp_run_id and topology, into log_run_context -- inside the MLflow run
+# it already opens per round.
+# ---------------------------------------------------------------------------
+
+
+class _FakeMinioResponse:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+
+class _FakeMinio:
+    """Stands in for the real Minio client `evaluate_global` constructs.
+
+    `evaluate_global` only ever calls get_object for the new global weights
+    (round_{fl_round + 1}); the actual tensor contents don't matter because
+    `_rollout` is monkeypatched below and never really reads them.
+    """
+
+    def __init__(self, endpoint=None, access_key=None, secret_key=None, secure=None):
+        pass
+
+    def get_object(self, bucket: str, key: str) -> _FakeMinioResponse:
+        buf = io.BytesIO()
+        torch.save({"w": torch.zeros(1)}, buf)
+        return _FakeMinioResponse(buf.getvalue())
+
+
+@pytest.fixture(autouse=True)
+def _patch_heavy_deps(monkeypatch):
+    monkeypatch.setattr("minio.Minio", _FakeMinio)
+    monkeypatch.setattr(
+        "src.aggregator.evaluator._rollout",
+        lambda weights, env_id, n_episodes, physics_seed, episode_seed: (
+            150.0,
+            [150.0] * n_episodes,
+            [200] * n_episodes,
+        ),
+    )
+    mlflow_mock = MagicMock()
+    mlflow_mock.start_run.return_value.__enter__.return_value = MagicMock()
+    mlflow_mock.start_run.return_value.__exit__.return_value = False
+    monkeypatch.setattr("mlflow.set_tracking_uri", mlflow_mock.set_tracking_uri)
+    monkeypatch.setattr("mlflow.set_experiment", mlflow_mock.set_experiment)
+    monkeypatch.setattr("mlflow.start_run", mlflow_mock.start_run)
+    monkeypatch.setattr("mlflow.log_metrics", mlflow_mock.log_metrics)
+    monkeypatch.setattr("mlflow.log_artifact", mlflow_mock.log_artifact)
+
+
+def _write_json(path, payload: dict) -> None:
+    with open(path, "w") as f:
+        json.dump(payload, f)
+
+
+def _aggregation_report_payload() -> dict:
+    return {
+        "round_summary": {
+            "clients_accepted": 2,
+            "clients_rejected": 0,
+            "effective_weight_norm": 1.0,
+        },
+        "active_data_applied": False,
+        "active_data_n_steps": 0,
+        "active_data_source_workers": [],
+        "scored_clients": [],
+    }
+
+
+def _run_evaluate_global(tmp_path, monkeypatch, *, kfp_run_id, topology, temporal_workflow_id):
+    from src.pipelines.active_fl_pipeline import evaluate_global
+
+    logged: dict = {}
+    monkeypatch.setattr(
+        "src.tracking.mlflow_logger.log_run_context", lambda **kw: logged.update(kw)
+    )
+
+    agg_report_path = tmp_path / "aggregation_report.json"
+    _write_json(agg_report_path, _aggregation_report_payload())
+
+    worker_report_path = tmp_path / "worker_report.json"
+    worker_payload = {"fl_round": 0, "succeeded": [0, 1], "failed": []}
+    if temporal_workflow_id:
+        worker_payload["temporal_workflow_id"] = temporal_workflow_id
+    _write_json(worker_report_path, worker_payload)
+
+    eval_result_path = tmp_path / "eval_result.json"
+
+    evaluate_global.python_func(
+        fl_round=0,
+        n_eval_episodes=1,
+        minio_endpoint="minio:9000",
+        minio_access_key="a",
+        minio_secret_key="b",
+        minio_bucket="bkt",
+        mlflow_tracking_uri="http://mlflow:5000",
+        mlflow_experiment_name="exp",
+        kfp_run_id=kfp_run_id,
+        topology=topology,
+        aggregation_report=SimpleNamespace(path=str(agg_report_path)),
+        worker_report=SimpleNamespace(path=str(worker_report_path)),
+        eval_result=SimpleNamespace(path=str(eval_result_path)),
+    )
+    return logged
+
+
+def test_evaluate_global_threads_temporal_workflow_id_from_worker_report(tmp_path, monkeypatch):
+    logged = _run_evaluate_global(
+        tmp_path,
+        monkeypatch,
+        kfp_run_id="abcdef1234",
+        topology="single",
+        temporal_workflow_id="train-abcdef12-r0",
+    )
+    assert logged["kfp_run_id"] == "abcdef1234"
+    assert logged["temporal_workflow_id"] == "train-abcdef12-r0"
+    assert logged["topology"] == "single"
+
+
+@pytest.mark.parametrize("topology", ["single", "multi"])
+def test_evaluate_global_topology_tag_correct_under_both_topologies(
+    tmp_path, monkeypatch, topology
+):
+    logged = _run_evaluate_global(
+        tmp_path,
+        monkeypatch,
+        kfp_run_id="abcdef1234",
+        topology=topology,
+        temporal_workflow_id="train-abcdef12-r0",
+    )
+    assert logged["topology"] == topology
+
+
+def test_evaluate_global_does_not_crash_when_worker_report_lacks_workflow_id(
+    tmp_path, monkeypatch
+):
+    # Regression guard for the Step 3 investigation: if a future change ever
+    # drops temporal_workflow_id from worker_report, evaluate_global must
+    # degrade to an empty string (which log_run_context then skips) rather
+    # than raising a KeyError that would fail the whole round.
+    logged = _run_evaluate_global(
+        tmp_path,
+        monkeypatch,
+        kfp_run_id="abcdef1234",
+        topology="single",
+        temporal_workflow_id="",
+    )
+    assert logged["temporal_workflow_id"] == ""

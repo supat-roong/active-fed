@@ -189,6 +189,12 @@ def train_workers(
             id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
         )
         print(f"started Temporal workflow {handle.id}")
+        # P4 Task 2, Step 4: KFP -> Temporal is the single most-used
+        # cross-link direction (a round looks wrong in MLflow, go see the
+        # fleet), so print a clickable line into this node's KFP logs. Base
+        # URL matches the Temporal UI's documented local port-forward
+        # (README.md, `make temporal-ui`).
+        print(f"Temporal workflow: http://localhost:8233/namespaces/default/workflows/{handle.id}")
         try:
             report = await handle.result()
         except WorkflowFailureError as e:
@@ -401,7 +407,18 @@ def evaluate_global(
     minio_bucket: str,
     mlflow_tracking_uri: str,
     mlflow_experiment_name: str,
+    # P4 Task 2: cross-link tags. kfp_run_id is the same identifier already
+    # threaded through the pipeline as train_workers' kfp_run_id (RoundSpec/
+    # WorkerSpec.kfp_run_id) -- NOT dsl.PIPELINE_JOB_ID_PLACEHOLDER, which
+    # this KFP deployment never substitutes (see the F4 gate-fix comments on
+    # run_uid below in active_fl_pipeline). temporal_workflow_id is read from
+    # worker_report below, not passed as a parameter -- it doesn't exist
+    # until train_workers starts the workflow, and evaluate_global already
+    # has an artifact-level path to that report via train_op's output.
+    kfp_run_id: str,
+    topology: str,
     aggregation_report: Input[Artifact],
+    worker_report: Input[Artifact],
     eval_result: Output[Artifact],
 ) -> None:
     """
@@ -427,6 +444,7 @@ def evaluate_global(
     os.environ["MLFLOW_S3_IGNORE_TLS"] = "true"
 
     from src.aggregator.evaluator import _rollout
+    from src.tracking.mlflow_logger import log_run_context
 
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger(__name__)
@@ -457,10 +475,26 @@ def evaluate_global(
     with open(aggregation_report.path) as f:
         report = json.load(f)
 
+    # P4 Task 2, Step 3: the Temporal workflow id train_workers writes into
+    # worker_report -- verified present in both the success and
+    # quorum-failure payloads (active_fl_pipeline.py's train_workers, and
+    # tests/test_train_workers_component.py). Falls back to "" (not a
+    # KeyError) so a malformed/legacy report degrades to a skipped tag
+    # (log_run_context) rather than failing the round -- tracking must never
+    # fail a training run.
+    with open(worker_report.path) as f:
+        worker_payload = json.load(f)
+    temporal_workflow_id = worker_payload.get("temporal_workflow_id", "")
+
     # Log to MLflow
     mlflow.set_tracking_uri(mlflow_tracking_uri)
     mlflow.set_experiment(mlflow_experiment_name)
     with mlflow.start_run(run_name=f"round_{fl_round}", nested=True):
+        log_run_context(
+            kfp_run_id=kfp_run_id,
+            temporal_workflow_id=temporal_workflow_id,
+            topology=topology,
+        )
         mlflow.log_metrics(
             {
                 "global_eval_reward_mean": mean_reward,
@@ -692,7 +726,13 @@ def active_fl_pipeline(
                 minio_bucket=minio_bucket,
                 mlflow_tracking_uri=mlflow_tracking_uri,
                 mlflow_experiment_name=mlflow_experiment_name,
+                # P4 Task 2: same kfp_run_id/topology values train_workers
+                # already receives above, plus train_op's own worker_report
+                # output -- the only place temporal_workflow_id is known.
+                kfp_run_id=run_uid,
+                topology=topology,
                 aggregation_report=agg_op.outputs["aggregation_report"],
+                worker_report=train_op.outputs["worker_report"],
             )
             .after(agg_op)
             .set_retry(num_retries=2, backoff_duration="60s", backoff_factor=2.0)

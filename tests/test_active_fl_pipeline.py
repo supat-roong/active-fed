@@ -410,3 +410,41 @@ def test_multi_config_nodeports_agree_with_the_multi_infra_contract():
         "config/k8s-multi.yaml's mlflow_nodeport disagrees with infra.env.multi's "
         "FED_NODEPORT_MLFLOW"
     )
+
+
+# ---------------------------------------------------------------------------
+# P4 Task 2: MLflow cross-link tags. evaluate_global is the only place that
+# opens an MLflow run per round, so it must actually receive the
+# worker_report artifact train_workers writes (for temporal_workflow_id) plus
+# kfp_run_id/topology -- structural proof (from the compiled IR) that the
+# wiring in active_fl_pipeline's DAG-assembly loop is real, not merely that
+# evaluate_global's Python body accepts the parameters.
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_global_receives_worker_report_from_train_workers(tmp_path):
+    text = _compile(tmp_path)
+    spec = yaml.safe_load(text)
+    tasks = spec["root"]["dag"]["tasks"]
+    eval_task = tasks["evaluate-global"]
+    worker_report_input = eval_task["inputs"]["artifacts"]["worker_report"]
+    assert worker_report_input["taskOutputArtifact"]["producerTask"] == "train-workers", (
+        "evaluate_global must read the same worker_report artifact train_workers "
+        "writes, not a copy re-derived elsewhere -- that's the only place "
+        "temporal_workflow_id is known"
+    )
+    assert "train-workers" in eval_task.get("dependentTasks", []), eval_task.get(
+        "dependentTasks"
+    )
+
+
+def test_evaluate_global_receives_kfp_run_id_and_topology(tmp_path):
+    text = _compile(tmp_path)
+    spec = yaml.safe_load(text)
+    tasks = spec["root"]["dag"]["tasks"]
+    eval_params = tasks["evaluate-global"]["inputs"]["parameters"]
+    assert eval_params["kfp_run_id"] == {"componentInputParameter": "run_uid"}, (
+        "evaluate_global's kfp_run_id must be bound to the same run_uid the rest "
+        "of the pipeline uses as its kfp_run_id, not a separate/new parameter"
+    )
+    assert eval_params["topology"] == {"componentInputParameter": "topology"}
