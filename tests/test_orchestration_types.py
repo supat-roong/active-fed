@@ -79,10 +79,65 @@ def test_round_spec_defaults_topology_to_single_with_no_member_cluster():
     assert spec.member_cluster == ""
 
 
-def test_worker_spec_inherits_round_topology_and_member_cluster():
-    spec = _round_spec(topology="multi", member_cluster="active-fed-member1").worker_spec(1)
+def test_worker_spec_inherits_round_topology():
+    spec = _round_spec(
+        topology="multi", member_count=2, member_prefix="active-fed-member"
+    ).worker_spec(1)
     assert spec.topology == "multi"
-    assert spec.member_cluster == "active-fed-member1"
+
+
+# ---------------------------------------------------------------------------
+# Round-robin worker -> member assignment (Task 5). Task 3 deliberately left
+# RoundSpec.worker_spec() passing a single static member_cluster straight
+# through to every worker; member_count/member_prefix (added here) let it
+# compute a distinct member per worker instead. physics_seed derives from
+# worker_id, so one worker per member cluster is what gives each member a
+# distinct physical variation -- the whole point of the multi topology.
+# ---------------------------------------------------------------------------
+
+
+def test_round_robin_assigns_distinct_members_across_workers():
+    spec = _round_spec(topology="multi", member_count=2, member_prefix="active-fed-member")
+    assert spec.worker_spec(0).member_cluster == "active-fed-member1"
+    assert spec.worker_spec(1).member_cluster == "active-fed-member2"
+
+
+def test_round_robin_wraps_when_workers_outnumber_members():
+    # 3 workers over 2 members -> member1, member2, member1.
+    spec = _round_spec(topology="multi", member_count=2, member_prefix="active-fed-member")
+    assignments = [spec.worker_spec(i).member_cluster for i in range(3)]
+    assert assignments == ["active-fed-member1", "active-fed-member2", "active-fed-member1"]
+
+
+def test_single_topology_worker_spec_ignores_member_count_and_prefix():
+    # topology="single" must keep yielding an empty member_cluster
+    # regardless of member_count/member_prefix -- those fields are only
+    # meaningful under topology="multi".
+    spec = _round_spec(member_count=2, member_prefix="active-fed-member")
+    assert spec.topology == "single"
+    assert spec.worker_spec(0).member_cluster == ""
+
+
+def test_multi_topology_with_zero_member_count_raises():
+    # The critical safety property, enforced one layer earlier than
+    # dispatch.py: member_count=0 must never silently produce an empty
+    # member_cluster (which would fan a worker's Job out to every joined
+    # member -- see dispatch.py's build_propagation_policy/dispatcher_for).
+    spec = _round_spec(topology="multi", member_count=0, member_prefix="active-fed-member")
+    with pytest.raises(ValueError):
+        spec.worker_spec(0)
+
+
+def test_multi_topology_with_blank_member_prefix_raises():
+    spec = _round_spec(topology="multi", member_count=2, member_prefix="")
+    with pytest.raises(ValueError):
+        spec.worker_spec(0)
+
+
+def test_multi_topology_with_negative_member_count_raises():
+    spec = _round_spec(topology="multi", member_count=-1, member_prefix="active-fed-member")
+    with pytest.raises(ValueError):
+        spec.worker_spec(0)
 
 
 def test_report_partitions_succeeded_and_failed():
