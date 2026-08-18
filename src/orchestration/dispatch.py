@@ -204,14 +204,14 @@ class KarmadaJobDispatcher:
     """
 
     async def ensure_job(self, spec: WorkerSpec) -> str:
-        batch, custom = _karmada_clients()
-        return await self._ensure_job_with(batch, custom, spec)
+        batch, custom, core = _karmada_clients()
+        return await self._ensure_job_with(batch, custom, spec, core=core)
 
     def delete_job(self, spec: WorkerSpec) -> None:
-        batch, custom = _karmada_clients()
+        batch, custom, _ = _karmada_clients()
         self._delete_job_with(batch, custom, spec)
 
-    async def _ensure_job_with(self, batch, custom, spec: WorkerSpec) -> str:
+    async def _ensure_job_with(self, batch, custom, spec: WorkerSpec, core=None) -> str:
         """Create the worker Job (and its PropagationPolicy) if absent,
         repairing a terminally-failed Job left over from a previous attempt
         instead of blindly re-attaching to it.
@@ -262,6 +262,17 @@ class KarmadaJobDispatcher:
         currently has that name, including the one just recreated here.
         """
         from kubernetes.client.exceptions import ApiException
+
+        # The Karmada control plane is a distinct apiserver with its own
+        # namespaces: the host cluster having FED_NAMESPACE says nothing about
+        # whether Karmada does. Without this, create_namespaced_job below dies
+        # with 404 `namespaces "<ns>" not found` and no Job or
+        # PropagationPolicy is ever created -- exactly how every worker
+        # dispatch failed on the first live multi-cluster run. Karmada
+        # propagates the namespace down to the members itself, so only the
+        # control-plane copy needs creating here.
+        if core is not None:
+            _ensure_namespace(core, spec.namespace)
 
         manifest = build_job_manifest(spec)
         name = manifest["metadata"]["name"]
@@ -364,4 +375,29 @@ def _karmada_clients():
             "path mounted into the Temporal worker pod for topology='multi'"
         )
     api_client = k8s_config.new_client_from_config(kubeconfig)
-    return client.BatchV1Api(api_client), client.CustomObjectsApi(api_client)
+    return (
+        client.BatchV1Api(api_client),
+        client.CustomObjectsApi(api_client),
+        client.CoreV1Api(api_client),
+    )
+
+
+def _ensure_namespace(core, namespace: str) -> None:
+    """Create `namespace` on whichever apiserver `core` points at, if absent.
+
+    Tolerates both races and re-runs: a 409 from create means someone else
+    (or a previous attempt) got there first, which is success, not failure.
+    """
+    from kubernetes.client.exceptions import ApiException
+
+    try:
+        core.read_namespace(name=namespace)
+        return
+    except ApiException as e:
+        if e.status != 404:
+            raise
+    try:
+        core.create_namespace(body={"metadata": {"name": namespace}})
+    except ApiException as e:
+        if e.status != 409:
+            raise

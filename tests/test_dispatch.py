@@ -487,3 +487,56 @@ async def test_karmada_job_manifest_reused_unchanged_from_p1():
     assert applied["metadata"]["name"] == job_name_for(spec)
     assert applied["spec"]["backoffLimit"] == 0
     assert applied["spec"]["template"]["spec"]["restartPolicy"] == "Never"
+
+
+class FakeCoreApi:
+    """Minimal CoreV1Api double recording namespace creation."""
+
+    def __init__(self, existing=None):
+        self.existing = set(existing or [])
+        self.created = []
+
+    def read_namespace(self, name):
+        if name not in self.existing:
+            raise ApiException(status=404)
+        return {"metadata": {"name": name}}
+
+    def create_namespace(self, body):
+        name = body["metadata"]["name"]
+        if name in self.existing:
+            raise ApiException(status=409)
+        self.existing.add(name)
+        self.created.append(name)
+        return body
+
+
+@pytest.mark.asyncio
+async def test_karmada_dispatcher_creates_the_namespace_on_the_control_plane():
+    """The Karmada apiserver has its own namespaces, separate from the host's.
+
+    Creating the worker Job on Karmada fails with 404 `namespaces "active-fed"
+    not found` unless the namespace exists *there* -- the host cluster having
+    it is irrelevant. Observed live during the P3 gate: every worker dispatch
+    died on this, with no Job and no PropagationPolicy ever created.
+    """
+    spec = _spec(topology="multi", member_cluster="active-fed-member1")
+    batch, custom, core = FakeBatchApi(), FakeCustomObjectsApi(), FakeCoreApi()
+
+    await KarmadaJobDispatcher()._ensure_job_with(batch, custom, spec, core=core)
+
+    assert spec.namespace in core.created, (
+        "the dispatcher did not create the namespace on the Karmada control "
+        "plane, so create_namespaced_job would 404"
+    )
+
+
+@pytest.mark.asyncio
+async def test_karmada_dispatcher_tolerates_an_existing_namespace():
+    """Re-running against a provisioned control plane must not fail."""
+    spec = _spec(topology="multi", member_cluster="active-fed-member1")
+    batch, custom = FakeBatchApi(), FakeCustomObjectsApi()
+    core = FakeCoreApi(existing={spec.namespace})
+
+    await KarmadaJobDispatcher()._ensure_job_with(batch, custom, spec, core=core)
+
+    assert core.created == [], "an already-present namespace must not be recreated"
