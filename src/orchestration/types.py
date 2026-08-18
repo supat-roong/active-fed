@@ -28,6 +28,17 @@ class WorkerSpec:
     mlflow_tracking_uri: str
     mlflow_experiment_name: str
     kfp_run_id: str
+    # P3: which deployment topology this worker's Job dispatches into.
+    # "single" (default) is today's local-cluster behaviour; "multi" means
+    # the Job is propagated by Karmada to member_cluster. See dispatch.py.
+    topology: str = "single"
+    # The Karmada member cluster this worker is pinned to. Only meaningful
+    # when topology == "multi" -- and required to be non-empty in that case:
+    # an empty clusterNames list in a Karmada PropagationPolicy targets ALL
+    # clusters, not none, so dispatch.py's dispatcher_for/build_propagation_
+    # policy raise rather than let this default silently fan a worker out to
+    # every member.
+    member_cluster: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,6 +58,8 @@ class RoundSpec:
     mlflow_tracking_uri: str
     mlflow_experiment_name: str
     kfp_run_id: str
+    topology: str = "single"
+    member_cluster: str = ""
 
     def worker_spec(self, worker_id: int) -> WorkerSpec:
         return WorkerSpec(
@@ -63,6 +76,8 @@ class RoundSpec:
             mlflow_tracking_uri=self.mlflow_tracking_uri,
             mlflow_experiment_name=self.mlflow_experiment_name,
             kfp_run_id=self.kfp_run_id,
+            topology=self.topology,
+            member_cluster=self.member_cluster,
         )
 
 
