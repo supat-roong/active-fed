@@ -193,7 +193,12 @@ def _aggregation_report_payload() -> dict:
     }
 
 
-def _run_evaluate_global(tmp_path, monkeypatch, *, kfp_run_id, topology, temporal_workflow_id):
+def _run_evaluate_global(tmp_path, monkeypatch, *, kfp_run_id, topology, temporal_workflow_id,
+    artifact_uri=(
+        "minio://mlpipeline/v2/artifacts/active-fl-cartpole/"
+        "51debb42-f3fa-4c95-946a-63dbd0e70ece/train-workers/uuid/worker_report"
+    ),
+):
     from src.pipelines.active_fl_pipeline import evaluate_global
 
     logged: dict = {}
@@ -224,7 +229,14 @@ def _run_evaluate_global(tmp_path, monkeypatch, *, kfp_run_id, topology, tempora
         kfp_run_id=kfp_run_id,
         topology=topology,
         aggregation_report=SimpleNamespace(path=str(agg_report_path)),
-        worker_report=SimpleNamespace(path=str(worker_report_path)),
+        worker_report=SimpleNamespace(
+            path=str(worker_report_path),
+            # KFP stamps its own run id into the artifact URI; that is
+            # where the kfp_run_id tag comes from, not the run_uid
+            # parameter (which names the bucket and Jobs and does not
+            # resolve in the KFP UI).
+            uri=artifact_uri,
+        ),
         eval_result=SimpleNamespace(path=str(eval_result_path)),
     )
     return logged
@@ -238,7 +250,11 @@ def test_evaluate_global_threads_temporal_workflow_id_from_worker_report(tmp_pat
         topology="single",
         temporal_workflow_id="train-abcdef12-r0",
     )
-    assert logged["kfp_run_id"] == "abcdef1234"
+    assert logged["kfp_run_id"] == "51debb42-f3fa-4c95-946a-63dbd0e70ece", (
+        "the tag must carry KFP's own run id, recovered from the artifact URI, "
+        "not the locally-generated run_uid -- a kfp_run_url built from run_uid "
+        "resolves to nothing in the KFP UI"
+    )
     assert logged["temporal_workflow_id"] == "train-abcdef12-r0"
     assert logged["topology"] == "single"
 
@@ -272,3 +288,76 @@ def test_evaluate_global_does_not_crash_when_worker_report_lacks_workflow_id(
         temporal_workflow_id="",
     )
     assert logged["temporal_workflow_id"] == ""
+
+
+class TestKfpRunIdFromArtifactUri:
+    """The KFP run id has to come from somewhere that actually resolves.
+
+    `run_uid` is a locally generated fragment used to name the MinIO bucket and
+    the worker Jobs; it is NOT the id KFP's UI uses in
+    `/#/runs/details/<id>`, so tagging it produced a kfp_run_url that silently
+    goes nowhere -- worse than no tag, because a broken link looks like data.
+
+    KFP embeds the real run id in every artifact URI it mints, e.g.
+      minio://mlpipeline/v2/artifacts/<pipeline>/<run-id>/<task>/<uuid>/<name>
+    and evaluate_global already receives such an artifact, so the id can be
+    recovered where it is needed without a new API call or placeholder.
+    """
+
+    def test_extracts_the_run_id_from_a_real_kfp_artifact_uri(self):
+        from src.tracking.mlflow_logger import kfp_run_id_from_artifact_uri
+
+        # Captured from a live gate run: run_pipeline.py reported this exact
+        # Run ID, and this is the artifact URI KFP minted for it.
+        uri = (
+            "minio://mlpipeline/v2/artifacts/active-fl-cartpole/"
+            "51debb42-f3fa-4c95-946a-63dbd0e70ece/train-workers/"
+            "0c443c88-d036-4e29-b990-bf939498c5aa/worker_report"
+        )
+        assert (
+            kfp_run_id_from_artifact_uri(uri) == "51debb42-f3fa-4c95-946a-63dbd0e70ece"
+        )
+
+    def test_returns_empty_for_an_unrecognised_uri_rather_than_guessing(self):
+        from src.tracking.mlflow_logger import kfp_run_id_from_artifact_uri
+
+        for uri in [
+            "",
+            "minio://mlpipeline/something/else",
+            "/local/path/worker_report",
+            "minio://mlpipeline/v2/artifacts",
+        ]:
+            assert kfp_run_id_from_artifact_uri(uri) == "", uri
+
+    def test_does_not_mistake_the_pipeline_name_for_the_run_id(self):
+        from src.tracking.mlflow_logger import kfp_run_id_from_artifact_uri
+
+        uri = (
+            "minio://mlpipeline/v2/artifacts/my-pipeline/"
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/task/uuid/artifact"
+        )
+        assert kfp_run_id_from_artifact_uri(uri) == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    def test_never_raises_on_malformed_input(self):
+        from src.tracking.mlflow_logger import kfp_run_id_from_artifact_uri
+
+        for bad in [None, 123, object()]:
+            assert kfp_run_id_from_artifact_uri(bad) == ""
+
+
+def test_evaluate_global_skips_the_kfp_tag_when_the_uri_is_unrecognised(tmp_path, monkeypatch):
+    """No tag beats a broken one.
+
+    If the artifact URI is not in KFP's expected layout, the run id cannot be
+    recovered, and writing kfp_run_url from a guess would produce a link that
+    404s while looking like real data.
+    """
+    logged = _run_evaluate_global(
+        tmp_path,
+        monkeypatch,
+        kfp_run_id="abcdef1234",
+        topology="single",
+        temporal_workflow_id="wf-1",
+        artifact_uri="/local/path/worker_report",
+    )
+    assert logged["kfp_run_id"] == ""

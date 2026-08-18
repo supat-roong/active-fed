@@ -444,7 +444,7 @@ def evaluate_global(
     os.environ["MLFLOW_S3_IGNORE_TLS"] = "true"
 
     from src.aggregator.evaluator import _rollout
-    from src.tracking.mlflow_logger import log_run_context
+    from src.tracking.mlflow_logger import kfp_run_id_from_artifact_uri, log_run_context
 
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger(__name__)
@@ -486,12 +486,20 @@ def evaluate_global(
         worker_payload = json.load(f)
     temporal_workflow_id = worker_payload.get("temporal_workflow_id", "")
 
+    # The kfp_run_id parameter carries run_uid, which names the MinIO bucket
+    # and the worker Jobs but is not the id KFP's UI resolves in
+    # /#/runs/details/<id>. KFP does stamp its own run id into every artifact
+    # URI it mints, and worker_report is one, so recover it from there.
+    # Falls back to "" -- log_run_context then skips the tag rather than
+    # writing a URL that goes nowhere.
+    kfp_backend_run_id = kfp_run_id_from_artifact_uri(getattr(worker_report, "uri", ""))
+
     # Log to MLflow
     mlflow.set_tracking_uri(mlflow_tracking_uri)
     mlflow.set_experiment(mlflow_experiment_name)
     with mlflow.start_run(run_name=f"round_{fl_round}", nested=True):
         log_run_context(
-            kfp_run_id=kfp_run_id,
+            kfp_run_id=kfp_backend_run_id,
             temporal_workflow_id=temporal_workflow_id,
             topology=topology,
         )

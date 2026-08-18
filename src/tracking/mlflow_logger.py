@@ -45,6 +45,37 @@ def log_round_metrics(
     log.info(f"[MLflow] Round {fl_round} | global_reward={global_eval_reward:.2f}")
 
 
+def kfp_run_id_from_artifact_uri(uri) -> str:
+    """Recover KFP's own run id from an artifact URI it minted, or "" if absent.
+
+    KFP lays artifacts out as
+      <scheme>://<bucket>/v2/artifacts/<pipeline-name>/<run-id>/<task>/<uuid>/<name>
+    so the segment directly after the pipeline name is the run id the KFP UI
+    uses in `/#/runs/details/<id>`.
+
+    This exists because the obvious candidates are both wrong. `run_uid` is a
+    locally generated fragment naming the MinIO bucket and worker Jobs, not
+    anything KFP knows about; and `dsl.PIPELINE_JOB_ID_PLACEHOLDER` does not
+    resolve in this deployment (established by the P2 "F4" finding). Tagging
+    either produced a `kfp_run_url` that silently goes nowhere, which is worse
+    than no tag at all -- a broken link reads as data.
+
+    Returns "" rather than raising or guessing on anything unrecognised, so
+    log_run_context skips the tag instead of writing a URL that 404s.
+    """
+    if not isinstance(uri, str):
+        return ""
+    parts = [p for p in uri.split("/") if p]
+    try:
+        marker = parts.index("artifacts")
+    except ValueError:
+        return ""
+    # parts[marker + 1] is the pipeline name, parts[marker + 2] the run id.
+    if len(parts) <= marker + 2:
+        return ""
+    return parts[marker + 2]
+
+
 def log_run_context(
     kfp_run_id: str,
     temporal_workflow_id: str,
