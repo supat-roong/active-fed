@@ -388,8 +388,17 @@ async def wait_for_worker_artifact(
     must be deterministic for Temporal's replay). Left as None (the
     default), no freshness check is performed, matching every pre-Finding-3
     caller.
+
+    Finding 4 (p3-task-4-review.md): besides S3Error, this also tolerates
+    urllib3.exceptions.MaxRetryError and ProtocolError -- the connection-
+    level exceptions a real MinIO pod restart or network blip actually
+    raises (verified against the installed minio==7.2.20; these never reach
+    the S3 protocol layer, so they are not S3Error instances). Deliberately
+    not a bare `except Exception`, which would also mask a genuine bug in
+    this loop.
     """
     from minio.error import S3Error
+    from urllib3.exceptions import MaxRetryError, ProtocolError
 
     key = f"round_{fl_round}/workers/worker_{worker_id}_metrics.json"
     waited = 0.0
@@ -407,6 +416,18 @@ async def wait_for_worker_artifact(
             if e.code not in ("NoSuchKey", "NoSuchObject"):
                 log.warning(f"transient MinIO error polling for {key}: {e}")
             # else: simply not uploaded yet -- keep polling.
+        except (MaxRetryError, ProtocolError) as e:
+            # Finding 4 (p3-task-4-review.md): a MinIO pod restart or network
+            # blip never reaches the S3 protocol layer, so it doesn't raise
+            # S3Error at all -- verified against the installed minio==7.2.20,
+            # a refused connection raises urllib3.exceptions.MaxRetryError
+            # (connect-phase failures, after urllib3's own internal retries
+            # are exhausted) or ProtocolError (a connection dropped mid-
+            # response). Deliberately not `except Exception`: that would also
+            # swallow a genuine bug in this loop (an AttributeError here
+            # already cost this project a full debugging session once), so
+            # only these two specific, connection-level classes are caught.
+            log.warning(f"transient connection error polling for {key}: {e}")
 
         if failure_check is not None:
             reason = await failure_check()

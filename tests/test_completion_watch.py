@@ -158,6 +158,93 @@ async def test_tolerates_a_transient_s3_error_and_keeps_polling(monkeypatch):
     assert client.calls == 3
 
 
+# ---------------------------------------------------------------------------
+# Finding 4 (p3-task-4-review.md): the transient-error tolerance above only
+# catches S3Error, but a MinIO pod restart or network blip raises a
+# connection-level urllib3 exception that never reaches the S3 protocol
+# layer at all. Verified against the installed minio==7.2.20: pointing a
+# real Minio client at a refused connection raises
+# urllib3.exceptions.MaxRetryError, not S3Error. ProtocolError (e.g. a
+# connection dropped mid-response) is the other realistic "network blip"
+# shape. Deliberately not testing a bare Exception/AttributeError here being
+# tolerated -- the whole point is that those must still propagate.
+# ---------------------------------------------------------------------------
+
+
+async def test_tolerates_a_connection_level_error_and_keeps_polling(monkeypatch):
+    from urllib3.exceptions import MaxRetryError
+
+    _patch_heartbeat(monkeypatch)
+    conn_error = MaxRetryError(pool=None, url="http://minio:9000/bucket/key", reason=None)
+    # Call 1 raises the connection-level error (a MinIO pod restart or
+    # network blip); call 2 finds the object. A loop that only caught
+    # S3Error would let this escape on the very first poll.
+    client = FakeMinioClient(keys={METRICS_KEY}, error_calls={1: conn_error})
+
+    result = await wait_for_worker_artifact(
+        client, BUCKET, FL_ROUND, WORKER_ID, timeout_s=5, poll_s=0.001
+    )
+
+    assert result is True
+    assert client.calls == 2
+
+
+async def test_tolerates_a_urllib3_protocol_error_and_keeps_polling(monkeypatch):
+    from urllib3.exceptions import ProtocolError
+
+    _patch_heartbeat(monkeypatch)
+    client = FakeMinioClient(
+        keys={METRICS_KEY}, error_calls={1: ProtocolError("Connection aborted.")}
+    )
+
+    result = await wait_for_worker_artifact(
+        client, BUCKET, FL_ROUND, WORKER_ID, timeout_s=5, poll_s=0.001
+    )
+
+    assert result is True
+    assert client.calls == 2
+
+
+async def test_does_not_swallow_a_genuine_bug_in_the_poll_loop(monkeypatch):
+    # THE guardrail: catching connection-level errors must not widen into
+    # catching bare Exception. An AttributeError (or any other real bug) in
+    # this loop must still propagate -- swallowing it here already cost this
+    # project a debugging session once (see p3-task-4-review.md, Finding 4).
+    _patch_heartbeat(monkeypatch)
+    client = FakeMinioClient(keys={METRICS_KEY}, error_calls={1: AttributeError("boom")})
+
+    with pytest.raises(AttributeError):
+        await wait_for_worker_artifact(
+            client, BUCKET, FL_ROUND, WORKER_ID, timeout_s=5, poll_s=0.001
+        )
+
+
+async def test_connection_level_errors_still_respect_the_overall_timeout(monkeypatch):
+    from urllib3.exceptions import MaxRetryError
+
+    # If every single poll hits a connection error and the artifact never
+    # appears, the loop must still bail out at timeout_s -- tolerance must
+    # not turn into an unbounded retry.
+    _patch_heartbeat(monkeypatch)
+
+    class AlwaysConnectionError:
+        def __init__(self):
+            self.calls = 0
+
+        def stat_object(self, bucket, key):
+            self.calls += 1
+            raise MaxRetryError(pool=None, url="http://minio:9000/x", reason=None)
+
+    client = AlwaysConnectionError()
+
+    with pytest.raises(TimeoutError):
+        await wait_for_worker_artifact(
+            client, BUCKET, FL_ROUND, WORKER_ID, timeout_s=0.03, poll_s=0.01
+        )
+
+    assert client.calls > 0
+
+
 async def test_does_not_treat_the_weights_object_alone_as_completion(monkeypatch):
     # THE subtlety: train_worker.py's _push_weights uploads weights, then the
     # delta, then the metrics JSON, in that order -- so only the metrics
