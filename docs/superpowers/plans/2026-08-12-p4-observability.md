@@ -242,3 +242,5 @@ P4 is complete when: both dashboards deploy as `fed-infra` components in both pr
 ## After P4
 
 All five planned phases are complete. The remaining backlog is `docs/superpowers/reviews/2026-08-12-P0-deferred-findings.md` — 15 minor findings deliberately deferred during P0, several of which concern weak test assertions that later phases may have already displaced. Re-triage that list before deciding whether any still warrant work.
+
+> **Correction (P0 backlog closeout):** the claim above that an unlisted `FED_TEMPLATE_VARS` entry "silently renders empty" is wrong, and was repeated from here into the P1 and P4 plans and several task briefs. `envsubst` leaves the placeholder *literally* (`${FED_X}` stays as that text), so the failure is visible: `kubectl apply` rejects it on a typed field. The whitelist is still mandatory; the hazard was overstated. Verified directly against `envsubst`.

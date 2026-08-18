@@ -18,3 +18,5 @@ are worth folding into P1-P4 when touching the same code.
 - Task 10: minor (deferred): MLflow rollout wait 180s -> 300s (more lenient, inherited from fed-infra's mlflow module).
 - Task 11: minor (deferred): active-fed's pre-existing uncommitted .gitignore + docs/ correctly left alone by the implementer.
 - Task 12: minor (deferred): metrics CSV came out header-only (32 bytes). Pre-existing race in fed-twin's log-tailing/scraping code in src/pipelines/single_twin_single_cluster_pipeline.py - last touched by commit 7e347c6, which PREDATES all conversion commits. Real values confirmed via MLflow API + pod logs instead.
+
+> **Correction (P0 backlog closeout):** the claim above that an unlisted `FED_TEMPLATE_VARS` entry "silently renders empty" is wrong, and was repeated from here into the P1 and P4 plans and several task briefs. `envsubst` leaves the placeholder *literally* (`${FED_X}` stays as that text), so the failure is visible: `kubectl apply` rejects it on a typed field. The whitelist is still mandatory; the hazard was overstated. Verified directly against `envsubst`.

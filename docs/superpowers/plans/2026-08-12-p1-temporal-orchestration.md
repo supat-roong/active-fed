@@ -1656,3 +1656,5 @@ P1 is complete only when **all** hold:
 - Karmada multi-cluster and `PropagationPolicy` dispatch → **P3**
 - Kubernetes Dashboard, Karmada Dashboard, MLflow cross-link tags → **P4**
 - Any change to the local runner, `config/local.yaml`, or RL/ML code — permanently out of scope for this line of work.
+
+> **Correction (P0 backlog closeout):** the claim above that an unlisted `FED_TEMPLATE_VARS` entry "silently renders empty" is wrong, and was repeated from here into the P1 and P4 plans and several task briefs. `envsubst` leaves the placeholder *literally* (`${FED_X}` stays as that text), so the failure is visible: `kubectl apply` rejects it on a typed field. The whitelist is still mandatory; the hazard was overstated. Verified directly against `envsubst`.
