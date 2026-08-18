@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from temporalio import activity
@@ -300,6 +301,7 @@ async def wait_for_worker_artifact(
     worker_id: int,
     timeout_s: float,
     poll_s: float,
+    failure_check: Callable[[], Awaitable[str | None]] | None = None,
 ) -> bool:
     """Poll MinIO for the one object that means a multi-cluster worker is done.
 
@@ -325,6 +327,22 @@ async def wait_for_worker_artifact(
     RetryPolicy(maximum_attempts=3) only ever fires for a *raised*
     exception, so returning False here would silently turn 3 retry attempts
     into 1 for every multi-cluster worker whose artifact never lands.
+
+    failure_check (Finding 2, p3-task-4-review.md): an optional zero-arg
+    async callable, invoked once per iteration alongside the MinIO check.
+    MinIO can only ever prove "the artifact isn't here yet" -- never "the
+    worker is dead" -- so without an independent signal, a crashed worker is
+    indistinguishable from a slow one and costs a full timeout_s to detect,
+    every single retry attempt. Returning a non-None string from
+    failure_check means "terminally failed, stop waiting", and raises
+    WorkerJobFailed with that string immediately. Returning None -- whether
+    because the check has no verdict yet (e.g. the Karmada aggregated Job
+    status hasn't propagated), is still lagging, or the worker is genuinely
+    still running -- must never be treated as failure; it simply means "keep
+    polling", identical to not passing failure_check at all. Keeping the
+    contract this narrow (a plain callable returning str | None) is what
+    lets this function stay ignorant of Karmada/dispatch.py and directly
+    unit-testable with a bare lambda/async def.
     """
     from minio.error import S3Error
 
@@ -338,6 +356,14 @@ async def wait_for_worker_artifact(
             if e.code not in ("NoSuchKey", "NoSuchObject"):
                 log.warning(f"transient MinIO error polling for {key}: {e}")
             # else: simply not uploaded yet -- keep polling.
+
+        if failure_check is not None:
+            reason = await failure_check()
+            if reason is not None:
+                raise WorkerJobFailed(
+                    f"worker {worker_id} round {fl_round}: job reached a terminal "
+                    f"failed state before producing {key}: {reason}"
+                )
 
         activity.heartbeat(
             {"worker_id": worker_id, "fl_round": fl_round, "waited_s": waited, "artifact": key}
@@ -460,6 +486,7 @@ async def _launch_and_watch_pod_multi(spec: WorkerSpec) -> WorkerResult:
             spec.worker_id,
             timeout_s=POD_WATCH_TIMEOUT_S,
             poll_s=POLL_INTERVAL_S,
+            failure_check=lambda: _karmada_terminal_failure(spec, name),
         )
     except Exception as e:
         reason = await _karmada_failure_reason(spec, name)
@@ -476,6 +503,43 @@ async def _launch_and_watch_pod_multi(spec: WorkerSpec) -> WorkerResult:
     )
 
 
+async def _karmada_job_status(spec: WorkerSpec, job_name: str) -> tuple[str | None, str]:
+    """Fetch and classify the Karmada aggregated Job status for one worker.
+
+    Shared by _karmada_failure_reason (best-effort enrichment consulted only
+    after wait_for_worker_artifact has already given up) and
+    _karmada_terminal_failure (Finding 2's fast-fail check, consulted
+    *during* the wait via wait_for_worker_artifact's failure_check
+    parameter). Returns (outcome, message):
+
+    - outcome is classify_job_status's result ('succeeded'/'failed'/
+      'running'), or None if no verdict could be reached at all -- the Job
+      hasn't propagated to the member cluster yet (the read 404s, which is
+      completely normal for the first few seconds after dispatch), the
+      Karmada apiserver is unreachable, or FED_KARMADA_CONFIG isn't set.
+      None must never be read as "failed": conflating an absent/lagging
+      status with failure would fast-fail a perfectly healthy round the
+      moment it's dispatched, before Karmada has had any chance to catch up.
+    - message is always a human-readable string, safe to fold into a raised
+      exception either way.
+    """
+    try:
+        from src.orchestration.dispatch import _karmada_clients
+
+        batch, _ = _karmada_clients()
+        job = batch.read_namespaced_job_status(name=job_name, namespace=spec.namespace)
+        status = job.status
+        conditions = ", ".join(f"{c.type}={c.status}" for c in (status.conditions or []))
+        message = (
+            f"active={status.active or 0} succeeded={status.succeeded or 0} "
+            f"failed={status.failed or 0} conditions=[{conditions}]"
+        )
+        backoff_limit = build_job_manifest(spec)["spec"]["backoffLimit"]
+        return classify_job_status(status, backoff_limit), message
+    except Exception as e:
+        return None, f"unavailable: {e}"
+
+
 async def _karmada_failure_reason(spec: WorkerSpec, job_name: str) -> str:
     """Best-effort diagnostics from the Karmada aggregated API for a failed
     multi-cluster worker.
@@ -487,19 +551,26 @@ async def _karmada_failure_reason(spec: WorkerSpec, job_name: str) -> str:
     and surfaces as a plain diagnostic string, exactly like
     _failure_reason/_log_tail's contract for the single-topology path.
     """
-    try:
-        from src.orchestration.dispatch import _karmada_clients
+    _, message = await _karmada_job_status(spec, job_name)
+    return message
 
-        batch, _ = _karmada_clients()
-        job = batch.read_namespaced_job_status(name=job_name, namespace=spec.namespace)
-        status = job.status
-        conditions = ", ".join(f"{c.type}={c.status}" for c in (status.conditions or []))
-        return (
-            f"active={status.active or 0} succeeded={status.succeeded or 0} "
-            f"failed={status.failed or 0} conditions=[{conditions}]"
-        )
-    except Exception as e:
-        return f"unavailable: {e}"
+
+async def _karmada_terminal_failure(spec: WorkerSpec, job_name: str) -> str | None:
+    """Fast-fail check (Finding 2, p3-task-4-review.md) wired into
+    wait_for_worker_artifact's poll loop via its failure_check parameter.
+
+    Returns a diagnostic message only when the Karmada aggregated Job status
+    is definitely, terminally Failed -- mirroring what classify_job_status
+    already does for the single-topology Job-watch loop above. Every other
+    case -- absent (Karmada hasn't propagated the Job to the member cluster
+    yet), still running, succeeded, or the aggregated API being unreachable
+    -- returns None, which wait_for_worker_artifact treats as "keep
+    polling". This is what lets a crashed worker be caught within roughly
+    one poll interval instead of the full POD_WATCH_TIMEOUT_S, without any
+    risk of a merely-absent-or-lagging status killing a healthy round.
+    """
+    outcome, message = await _karmada_job_status(spec, job_name)
+    return message if outcome == "failed" else None
 
 
 async def _attempt_count(core, spec: WorkerSpec, job_name: str) -> int:

@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 from minio.error import S3Error
 
-from src.orchestration.activities import wait_for_worker_artifact
+from src.orchestration.activities import WorkerJobFailed, wait_for_worker_artifact
 
 FL_ROUND = 4
 WORKER_ID = 1
@@ -165,3 +165,69 @@ async def test_does_not_treat_the_weights_object_alone_as_completion(monkeypatch
     # satisfied merely because the weights key happens to already exist.
     assert client.queried_keys
     assert all(k == METRICS_KEY for k in client.queried_keys)
+
+
+# ---------------------------------------------------------------------------
+# Finding 2 (p3-task-4-review.md): a crashed multi-cluster worker was only
+# ever detected via the full timeout_s, because wait_for_worker_artifact had
+# no way to distinguish "crashed" from "still training". failure_check is an
+# optional zero-arg async callable, polled once per iteration alongside the
+# MinIO check: returning a diagnostic string means "terminally failed, stop
+# waiting now"; returning None means "no news" and must never raise -- that
+# covers the absent/lagging Karmada-status case explicitly (production wires
+# this to _karmada_terminal_failure; these tests exercise the generic
+# contract with a plain async callable, keeping wait_for_worker_artifact
+# itself ignorant of Karmada).
+# ---------------------------------------------------------------------------
+
+
+async def test_raises_immediately_when_failure_check_reports_terminal_failure(monkeypatch):
+    _patch_heartbeat(monkeypatch)
+    client = FakeMinioClient(keys=set())  # metrics object never appears
+
+    async def failed_check():
+        return "Job aflw-xxx-r4-w1 is terminally Failed"
+
+    with pytest.raises(WorkerJobFailed) as exc_info:
+        await wait_for_worker_artifact(
+            client, BUCKET, FL_ROUND, WORKER_ID, timeout_s=5, poll_s=0.01,
+            failure_check=failed_check,
+        )
+
+    assert "terminally Failed" in str(exc_info.value)
+    # The whole point: raised on (about) the first poll, nowhere near
+    # timeout_s=5 / poll_s=0.01's ~500 iterations.
+    assert client.calls <= 2
+
+
+async def test_absent_or_lagging_failure_check_never_short_circuits_the_wait(monkeypatch):
+    # THE safety property: right after dispatch, before Karmada has
+    # propagated the Job, there is no aggregated status yet -- absent means
+    # "not yet", never "failed". A failure_check that always reports "no
+    # news" (absent, lagging, or genuinely still running) must never raise;
+    # the wait must still time out normally once the artifact really never
+    # appears, exactly as it did before failure_check existed.
+    _patch_heartbeat(monkeypatch)
+    client = FakeMinioClient(keys=set())
+
+    async def never_fails():
+        return None
+
+    with pytest.raises(TimeoutError):
+        await wait_for_worker_artifact(
+            client, BUCKET, FL_ROUND, WORKER_ID, timeout_s=0.03, poll_s=0.01,
+            failure_check=never_fails,
+        )
+
+
+async def test_failure_check_is_optional_and_defaults_to_never_firing(monkeypatch):
+    # Backward compatibility: every test above (and every pre-Finding-2
+    # caller) invokes wait_for_worker_artifact without failure_check at all.
+    _patch_heartbeat(monkeypatch)
+    client = FakeMinioClient(keys={METRICS_KEY})
+
+    result = await wait_for_worker_artifact(
+        client, BUCKET, FL_ROUND, WORKER_ID, timeout_s=5, poll_s=0.01
+    )
+
+    assert result is True

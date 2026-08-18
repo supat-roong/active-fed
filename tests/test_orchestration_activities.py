@@ -136,8 +136,8 @@ def _condition(type_: str, status: str) -> SimpleNamespace:
     return SimpleNamespace(type=type_, status=status)
 
 
-def _job_status(conditions=None, succeeded=None, failed=None) -> SimpleNamespace:
-    return SimpleNamespace(conditions=conditions, succeeded=succeeded, failed=failed)
+def _job_status(conditions=None, succeeded=None, failed=None, active=None) -> SimpleNamespace:
+    return SimpleNamespace(conditions=conditions, succeeded=succeeded, failed=failed, active=active)
 
 
 def test_classify_job_status_succeeded_on_complete_condition():
@@ -522,3 +522,137 @@ async def test_cleanup_worker_job_multi_topology_deletes_via_dispatcher(monkeypa
     await cleanup_worker_job(_multi_spec())
 
     assert fake_dispatcher.delete_calls == [2]
+
+
+# ---------------------------------------------------------------------------
+# Finding 2 (p3-task-4-review.md): a crashed multi-cluster worker was only
+# detected via wait_for_worker_artifact's full timeout_s, because nothing
+# actively consulted the Karmada aggregated Job status *during* the wait --
+# only after it gave up, as best-effort diagnostics (_karmada_failure_reason).
+# _karmada_terminal_failure is the fast-fail check now wired into the poll
+# loop via wait_for_worker_artifact's failure_check parameter: these tests
+# cover its own absent/lagging/failed/unreachable contract directly, plus one
+# end-to-end test proving the wiring actually fires through
+# launch_and_watch_pod.
+# ---------------------------------------------------------------------------
+
+
+class FakeKarmadaBatchApi404:
+    """Simulates a Job Karmada hasn't propagated to the member cluster yet --
+    read_namespaced_job_status 404s, exactly like a Job that doesn't exist."""
+
+    def read_namespaced_job_status(self, name, namespace):
+        raise ApiException(status=404)
+
+
+class FakeKarmadaBatchApiStatus:
+    """Reports whatever status object it's given, unconditionally."""
+
+    def __init__(self, status):
+        self.status = status
+
+    def read_namespaced_job_status(self, name, namespace):
+        return SimpleNamespace(status=self.status)
+
+
+async def test_karmada_terminal_failure_returns_none_when_not_yet_propagated(monkeypatch):
+    # THE safety property: absent status (Karmada hasn't propagated the Job
+    # yet -- true for every worker in the first few seconds after dispatch)
+    # must never be misread as failure.
+    import src.orchestration.dispatch as dispatch_module
+    from src.orchestration.activities import _karmada_terminal_failure
+
+    monkeypatch.setattr(
+        dispatch_module, "_karmada_clients", lambda: (FakeKarmadaBatchApi404(), None)
+    )
+
+    result = await _karmada_terminal_failure(_multi_spec(), "fake-job-w2")
+
+    assert result is None
+
+
+async def test_karmada_terminal_failure_returns_none_when_still_running(monkeypatch):
+    # Lagging/in-progress status (no terminal condition yet) must not fail
+    # the wait either -- only a definite Failed condition may.
+    import src.orchestration.dispatch as dispatch_module
+    from src.orchestration.activities import _karmada_terminal_failure
+
+    running = _job_status(conditions=[])
+    monkeypatch.setattr(
+        dispatch_module, "_karmada_clients", lambda: (FakeKarmadaBatchApiStatus(running), None)
+    )
+
+    result = await _karmada_terminal_failure(_multi_spec(), "fake-job-w2")
+
+    assert result is None
+
+
+async def test_karmada_terminal_failure_returns_none_when_karmada_unreachable(monkeypatch):
+    # Best-effort: an unreachable Karmada apiserver (or unset
+    # FED_KARMADA_CONFIG) is "unknown", not "failed" -- MinIO polling remains
+    # the ground truth and must not be short-circuited by a diagnostics-only
+    # lookup failing.
+    import src.orchestration.dispatch as dispatch_module
+    from src.orchestration.activities import _karmada_terminal_failure
+
+    monkeypatch.setattr(
+        dispatch_module, "_karmada_clients",
+        lambda: (_ for _ in ()).throw(RuntimeError("karmada apiserver unreachable")),
+    )
+
+    result = await _karmada_terminal_failure(_multi_spec(), "fake-job-w2")
+
+    assert result is None
+
+
+async def test_karmada_terminal_failure_returns_a_reason_when_terminally_failed(monkeypatch):
+    import src.orchestration.dispatch as dispatch_module
+    from src.orchestration.activities import _karmada_terminal_failure
+
+    failed = _job_status(conditions=[_condition("Failed", "True")])
+    monkeypatch.setattr(
+        dispatch_module, "_karmada_clients", lambda: (FakeKarmadaBatchApiStatus(failed), None)
+    )
+
+    result = await _karmada_terminal_failure(_multi_spec(), "fake-job-w2")
+
+    assert result is not None
+    assert "failed" in result.lower()
+
+
+async def test_launch_and_watch_pod_multi_topology_fast_fails_on_terminal_karmada_status(
+    monkeypatch,
+):
+    # End-to-end: the wiring from launch_and_watch_pod through
+    # wait_for_worker_artifact's failure_check must actually fire, raising
+    # long before POD_WATCH_TIMEOUT_S (kept comparatively large here) elapses.
+    import time
+
+    import src.orchestration.activities as activities_module
+    import src.orchestration.dispatch as dispatch_module
+    from src.orchestration.activities import WorkerJobFailed
+
+    _forbid_k8s_batch_and_core(monkeypatch)
+    monkeypatch.setattr(activities_module, "POD_WATCH_TIMEOUT_S", 5)
+    monkeypatch.setattr(activities_module, "POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(activities_module.activity, "heartbeat", lambda *a, **k: None)
+
+    fake_dispatcher = FakeDispatcher()
+    monkeypatch.setattr(dispatch_module, "dispatcher_for", lambda spec: fake_dispatcher)
+    monkeypatch.setattr(
+        activities_module, "_minio_client_for",
+        lambda spec: FakeMinioClientForActivities(present=False),
+    )
+    failed = _job_status(conditions=[_condition("Failed", "True")])
+    monkeypatch.setattr(
+        dispatch_module, "_karmada_clients", lambda: (FakeKarmadaBatchApiStatus(failed), None)
+    )
+
+    start = time.monotonic()
+    with pytest.raises(WorkerJobFailed):
+        await launch_and_watch_pod(_multi_spec())
+    elapsed = time.monotonic() - start
+
+    # The whole point of Finding 2: nowhere near the 5s POD_WATCH_TIMEOUT_S,
+    # let alone the real 3600s default.
+    assert elapsed < 1.0
