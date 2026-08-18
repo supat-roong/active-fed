@@ -408,13 +408,26 @@ async def test_launch_and_watch_pod_returns_normally_on_success(monkeypatch):
 
 
 def _multi_spec(**overrides) -> WorkerSpec:
-    return _spec(topology="multi", member_cluster="active-fed-member1", **overrides)
+    # minio_nodeport/mlflow_nodeport default to the same values
+    # infra.env.multi/config/k8s-multi.yaml actually carry -- every real
+    # topology='multi' WorkerSpec has these configured (see
+    # test_orchestration_types.py's threading tests and
+    # test_active_fl_pipeline.py's infra-contract tests), so a test built from
+    # this helper that doesn't care about the endpoint rewrite shouldn't have
+    # to think about it.
+    base = dict(minio_nodeport=30900, mlflow_nodeport=30500)
+    base.update(overrides)
+    return _spec(topology="multi", member_cluster="active-fed-member1", **base)
 
 
 class FakeDispatcher:
     def __init__(self):
         self.ensure_calls: list[int] = []
         self.delete_calls: list[int] = []
+        # Full specs ensure_job actually received, in call order -- lets a
+        # test assert on *what* was dispatched (e.g. the endpoint-rewrite
+        # tests below), not just *that* something with the right worker_id was.
+        self.received_specs: list[WorkerSpec] = []
 
     async def ensure_job(self, spec):
         # async to match JobDispatcher.ensure_job's Protocol (p3-task-3-review.md
@@ -422,6 +435,7 @@ class FakeDispatcher:
         # delete-and-recreate poll on 409, so the Protocol -- and its callers,
         # launch_and_watch_pod included -- await ensure_job unconditionally).
         self.ensure_calls.append(spec.worker_id)
+        self.received_specs.append(spec)
         return f"fake-job-w{spec.worker_id}"
 
     def delete_job(self, spec):
@@ -456,9 +470,15 @@ class FakeMinioClientForActivities:
 
 
 def _forbid_k8s_batch_and_core(monkeypatch):
-    """topology='multi' must never touch _k8s_batch_and_core -- that seam is
-    the local-cluster client; dispatching to a member cluster goes through
-    dispatcher_for/Karmada instead."""
+    """topology='multi' must never touch _k8s_batch_and_core to create/watch
+    the worker Job -- that seam is the local-cluster client; dispatching to a
+    member cluster goes through dispatcher_for/Karmada instead.
+
+    Still valid for cleanup_worker_job (below): deleting a Job/PropagationPolicy
+    never needs the host node IP, so cleanup should never call this either.
+    launch_and_watch_pod's multi path is different -- see
+    _fake_k8s_batch_and_core_for_multi just below.
+    """
     import src.orchestration.activities as activities_module
 
     def _boom():
@@ -467,11 +487,36 @@ def _forbid_k8s_batch_and_core(monkeypatch):
     monkeypatch.setattr(activities_module, "_k8s_batch_and_core", _boom)
 
 
+def _fake_k8s_batch_and_core_for_multi(monkeypatch, ip: str = "172.18.0.2"):
+    """topology='multi' now legitimately calls _k8s_batch_and_core once per
+    dispatch, to resolve the host cluster's own node IP for the MinIO/MLflow
+    endpoint rewrite (_resolve_host_node_ip/_rewrite_endpoints_for_multi) --
+    unlike _forbid_k8s_batch_and_core above, this seam must not be forbidden
+    for launch_and_watch_pod's multi tests any more.
+
+    It must still never be used to create/watch the worker Job itself (that
+    stays on dispatcher_for/Karmada): the BatchV1Api half of the pair returned
+    here is left as None, so a regression that reached for it to touch the
+    Job would fail with an AttributeError instead of silently passing.
+    """
+    import src.orchestration.activities as activities_module
+
+    node = SimpleNamespace(
+        metadata=SimpleNamespace(name="active-fed-host-control-plane"),
+        status=SimpleNamespace(
+            conditions=[_condition("Ready", "True")],
+            addresses=[SimpleNamespace(type="InternalIP", address=ip)],
+        ),
+    )
+    core = SimpleNamespace(list_node=lambda: SimpleNamespace(items=[node]))
+    monkeypatch.setattr(activities_module, "_k8s_batch_and_core", lambda: (None, core))
+
+
 async def test_launch_and_watch_pod_multi_topology_dispatches_and_waits_for_artifact(monkeypatch):
     import src.orchestration.activities as activities_module
     import src.orchestration.dispatch as dispatch_module
 
-    _forbid_k8s_batch_and_core(monkeypatch)
+    _fake_k8s_batch_and_core_for_multi(monkeypatch, ip="172.18.0.2")
     fake_dispatcher = FakeDispatcher()
     monkeypatch.setattr(dispatch_module, "dispatcher_for", lambda spec: fake_dispatcher)
     fake_minio = FakeMinioClientForActivities(present=True)
@@ -484,6 +529,12 @@ async def test_launch_and_watch_pod_multi_topology_dispatches_and_waits_for_arti
     assert result.failure_reason == ""
     assert fake_dispatcher.ensure_calls == [2]
     assert fake_minio.calls == 1
+    # The endpoint rewrite must have happened before dispatch: the spec
+    # ensure_job actually received (and therefore build_job_manifest sees) is
+    # the rewritten one, not the original in-cluster-DNS spec.
+    dispatched_spec = fake_dispatcher.received_specs[0]
+    assert dispatched_spec.minio_endpoint == "172.18.0.2:30900"
+    assert dispatched_spec.mlflow_tracking_uri == "http://172.18.0.2:30500"
 
 
 async def test_launch_and_watch_pod_multi_topology_raises_not_returns_on_missing_artifact(
@@ -499,7 +550,7 @@ async def test_launch_and_watch_pod_multi_topology_raises_not_returns_on_missing
     import src.orchestration.dispatch as dispatch_module
     from src.orchestration.activities import WorkerJobFailed
 
-    _forbid_k8s_batch_and_core(monkeypatch)
+    _fake_k8s_batch_and_core_for_multi(monkeypatch)
     monkeypatch.setattr(activities_module, "POD_WATCH_TIMEOUT_S", 0.03)
     monkeypatch.setattr(activities_module, "POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr(activities_module.activity, "heartbeat", lambda *a, **k: None)
@@ -645,7 +696,7 @@ async def test_launch_and_watch_pod_multi_topology_fast_fails_on_terminal_karmad
     import src.orchestration.dispatch as dispatch_module
     from src.orchestration.activities import WorkerJobFailed
 
-    _forbid_k8s_batch_and_core(monkeypatch)
+    _fake_k8s_batch_and_core_for_multi(monkeypatch)
     monkeypatch.setattr(activities_module, "POD_WATCH_TIMEOUT_S", 5)
     monkeypatch.setattr(activities_module, "POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr(activities_module.activity, "heartbeat", lambda *a, **k: None)
@@ -688,7 +739,7 @@ async def test_launch_and_watch_pod_multi_topology_ignores_a_preexisting_stale_a
     import src.orchestration.dispatch as dispatch_module
     from src.orchestration.activities import WorkerJobFailed
 
-    _forbid_k8s_batch_and_core(monkeypatch)
+    _fake_k8s_batch_and_core_for_multi(monkeypatch)
     monkeypatch.setattr(activities_module, "POD_WATCH_TIMEOUT_S", 0.03)
     monkeypatch.setattr(activities_module, "POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr(activities_module.activity, "heartbeat", lambda *a, **k: None)
@@ -713,3 +764,230 @@ async def test_launch_and_watch_pod_multi_topology_ignores_a_preexisting_stale_a
     # object), not succeeded on the very first call the way the pre-fix
     # code did.
     assert stale_artifact.calls > 1
+
+
+# ---------------------------------------------------------------------------
+# P3 multi-endpoints fix: topology='multi' worker pods run on a Karmada
+# *member* cluster with its own DNS -- WorkerSpec.minio_endpoint/
+# mlflow_tracking_uri are in-cluster DNS names belonging to the *host*
+# cluster, so they never resolve there. This is the bug the live gate found:
+#
+#   [worker] WARNING Retrying ... NameResolutionError(
+#     "...mlflow-service.active-fed.svc.cluster.local...
+#     Failed to resolve ... Name or service not known")
+#
+# Every kind cluster in this project's environment shares one Docker bridge
+# network, so a member pod *can* reach the host's MinIO/MLflow NodePorts via
+# the host's own node IP (verified live: curl http://172.18.0.2:30500/ ->
+# 200). _resolve_host_node_ip resolves that IP fresh from the host cluster's
+# own API on every dispatch -- never hardcoded, since it moved from
+# 172.18.0.3 to 172.18.0.2 across a single VM restart in the live
+# environment -- and _rewrite_endpoints_for_multi uses it (plus the
+# configured minio_nodeport/mlflow_nodeport) to replace both endpoints on the
+# WorkerSpec before it is ever dispatched.
+# ---------------------------------------------------------------------------
+
+
+def _node(name: str, ready: bool = True, addresses=None) -> SimpleNamespace:
+    conditions = [_condition("Ready", "True" if ready else "False")]
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name=name),
+        status=SimpleNamespace(conditions=conditions, addresses=addresses or []),
+    )
+
+
+def _fake_core_with_nodes(nodes) -> SimpleNamespace:
+    return SimpleNamespace(list_node=lambda: SimpleNamespace(items=nodes))
+
+
+def test_resolve_host_node_ip_returns_the_ready_nodes_internal_ip():
+    from src.orchestration.activities import _resolve_host_node_ip
+
+    node = _node(
+        "host-control-plane",
+        addresses=[SimpleNamespace(type="InternalIP", address="172.18.0.2")],
+    )
+    core = _fake_core_with_nodes([node])
+
+    assert _resolve_host_node_ip(core) == "172.18.0.2"
+
+
+def test_resolve_host_node_ip_skips_a_not_ready_node():
+    not_ready = _node(
+        "not-ready-node", ready=False,
+        addresses=[SimpleNamespace(type="InternalIP", address="172.18.0.9")],
+    )
+    ready = _node(
+        "ready-node",
+        addresses=[SimpleNamespace(type="InternalIP", address="172.18.0.2")],
+    )
+    core = _fake_core_with_nodes([not_ready, ready])
+
+    from src.orchestration.activities import _resolve_host_node_ip
+
+    assert _resolve_host_node_ip(core) == "172.18.0.2"
+
+
+def test_resolve_host_node_ip_raises_when_there_are_no_nodes_at_all():
+    from src.orchestration.activities import _resolve_host_node_ip
+
+    core = _fake_core_with_nodes([])
+
+    with pytest.raises(RuntimeError, match="node"):
+        _resolve_host_node_ip(core)
+
+
+def test_resolve_host_node_ip_raises_when_no_node_is_ready():
+    from src.orchestration.activities import _resolve_host_node_ip
+
+    core = _fake_core_with_nodes([_node("n1", ready=False)])
+
+    with pytest.raises(RuntimeError, match="Ready"):
+        _resolve_host_node_ip(core)
+
+
+def test_resolve_host_node_ip_raises_when_the_ready_node_has_no_internal_ip():
+    from src.orchestration.activities import _resolve_host_node_ip
+
+    node = _node("n1", addresses=[SimpleNamespace(type="Hostname", address="host1")])
+    core = _fake_core_with_nodes([node])
+
+    with pytest.raises(RuntimeError, match="InternalIP"):
+        _resolve_host_node_ip(core)
+
+
+def test_rewrite_endpoints_for_multi_rewrites_both_endpoints(monkeypatch):
+    import src.orchestration.activities as activities_module
+    from src.orchestration.activities import _rewrite_endpoints_for_multi
+
+    node = _node(
+        "host-control-plane",
+        addresses=[SimpleNamespace(type="InternalIP", address="172.18.0.2")],
+    )
+    core = _fake_core_with_nodes([node])
+    monkeypatch.setattr(activities_module, "_k8s_batch_and_core", lambda: (None, core))
+
+    spec = _multi_spec()
+    rewritten = _rewrite_endpoints_for_multi(spec)
+
+    assert rewritten.minio_endpoint == "172.18.0.2:30900"
+    assert rewritten.mlflow_tracking_uri == "http://172.18.0.2:30500"
+    # Everything else on the spec is untouched.
+    assert rewritten.worker_id == spec.worker_id
+    assert rewritten.member_cluster == spec.member_cluster
+    # dataclasses.replace returns a new instance -- the original (frozen)
+    # spec must never be mutated in place.
+    assert spec.minio_endpoint == "minio-service:9000"
+    assert spec.mlflow_tracking_uri == "http://mlflow:5000"
+
+
+def test_rewrite_endpoints_for_multi_uses_the_configured_nodeports_not_hardcoded_ones(monkeypatch):
+    import src.orchestration.activities as activities_module
+    from src.orchestration.activities import _rewrite_endpoints_for_multi
+
+    node = _node(
+        "host-control-plane",
+        addresses=[SimpleNamespace(type="InternalIP", address="172.18.0.2")],
+    )
+    core = _fake_core_with_nodes([node])
+    monkeypatch.setattr(activities_module, "_k8s_batch_and_core", lambda: (None, core))
+
+    spec = _multi_spec(minio_nodeport=19000, mlflow_nodeport=19500)
+    rewritten = _rewrite_endpoints_for_multi(spec)
+
+    assert rewritten.minio_endpoint == "172.18.0.2:19000"
+    assert rewritten.mlflow_tracking_uri == "http://172.18.0.2:19500"
+
+
+def test_rewrite_endpoints_for_multi_raises_a_clear_error_when_nodeports_are_unconfigured(
+    monkeypatch,
+):
+    # Mutation guard for the "fail loudly, don't silently produce a broken
+    # endpoint" constraint: minio_nodeport/mlflow_nodeport default to 0
+    # (types.py) for topology='single', where they're never read. A
+    # topology='multi' spec that somehow reaches this function with an
+    # unconfigured (zero) nodeport must raise here, immediately -- not build
+    # an endpoint like "172.18.0.2:0" that fails softly, minutes later, as an
+    # unreachable-connection timeout indistinguishable from the original bug.
+    #
+    # ValueError specifically (not RuntimeError): this is a deterministic
+    # input-validation failure exactly like job_name_for's kfp_run_id check
+    # (activities.py) -- every one of Temporal's 3 retries would rebuild the
+    # exact same spec and fail identically, so WorkerWorkflow's RetryPolicy
+    # (workflows.py, non_retryable_error_types=["ValueError"]) fails it fast
+    # instead of burning ~40s of backoff on retries that cannot succeed. This
+    # is deliberately distinct from _resolve_host_node_ip's own RuntimeError
+    # (below), which stays retryable because a node-listing failure or a
+    # briefly-NotReady node is plausibly transient.
+    import src.orchestration.activities as activities_module
+    from src.orchestration.activities import _rewrite_endpoints_for_multi
+
+    def _boom():
+        raise AssertionError("must not resolve a node IP before validating nodeports")
+
+    monkeypatch.setattr(activities_module, "_k8s_batch_and_core", _boom)
+
+    with pytest.raises(ValueError, match="nodeport"):
+        _rewrite_endpoints_for_multi(_multi_spec(minio_nodeport=0, mlflow_nodeport=0))
+
+
+def test_rewrite_endpoints_for_multi_raises_a_clear_error_when_the_node_lookup_fails(monkeypatch):
+    import src.orchestration.activities as activities_module
+    from src.orchestration.activities import _rewrite_endpoints_for_multi
+
+    core = _fake_core_with_nodes([])  # no nodes at all
+    monkeypatch.setattr(activities_module, "_k8s_batch_and_core", lambda: (None, core))
+
+    with pytest.raises(RuntimeError, match="node"):
+        _rewrite_endpoints_for_multi(_multi_spec())
+
+
+async def test_launch_and_watch_pod_multi_topology_raises_when_node_lookup_fails(monkeypatch):
+    # End-to-end, through the real activity entrypoint (not just the
+    # _rewrite_endpoints_for_multi/_resolve_host_node_ip unit tests above): a
+    # failed node lookup must propagate out of launch_and_watch_pod as a
+    # raised exception, before any Job is ever dispatched. THE constraint of
+    # this whole fix area: "launch_and_watch_pod must RAISE on failure, never
+    # return a failed result" -- Temporal only retries on raised exceptions.
+    import src.orchestration.activities as activities_module
+
+    core_with_no_nodes = SimpleNamespace(list_node=lambda: SimpleNamespace(items=[]))
+    monkeypatch.setattr(
+        activities_module, "_k8s_batch_and_core", lambda: (None, core_with_no_nodes)
+    )
+
+    with pytest.raises(RuntimeError, match="node"):
+        await launch_and_watch_pod(_multi_spec())
+
+
+async def test_launch_and_watch_pod_single_topology_never_looks_up_a_node(monkeypatch):
+    # topology='single' must be completely unaffected: same endpoints, same
+    # code path, *no node lookup at all*. Monkeypatching _resolve_host_node_ip
+    # to explode makes this a hard failure (not merely an absent assertion) if
+    # the single-topology path is ever accidentally routed through the
+    # multi-only rewrite.
+    import src.orchestration.activities as activities_module
+
+    def _boom(core):
+        raise AssertionError("_resolve_host_node_ip must not be called for topology='single'")
+
+    monkeypatch.setattr(activities_module, "_resolve_host_node_ip", _boom)
+
+    succeeded_status = _job_status(conditions=[_condition("Complete", "True")])
+    batch = FakeBatchApiTerminal(succeeded_status)
+    core = FakeCoreApi(
+        pods=[_terminated_pod("aflw-abcdef12-r3-w2-xyz99", "Completed", 0)],
+        logs={"aflw-abcdef12-r3-w2-xyz99": "training complete\n"},
+    )
+    monkeypatch.setattr(activities_module, "_k8s_batch_and_core", lambda: (batch, core))
+
+    spec = _spec()  # topology defaults to "single"
+    result = await launch_and_watch_pod(spec)
+
+    assert result.succeeded is True
+    env = {
+        e["name"]: e["value"]
+        for e in build_job_manifest(spec)["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert env["MINIO_ENDPOINT"] == "minio-service:9000"
+    assert env["MLFLOW_TRACKING_URI"] == "http://mlflow:5000"

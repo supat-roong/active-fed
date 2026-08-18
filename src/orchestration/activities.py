@@ -10,6 +10,7 @@ Kubernetes API plus heartbeating.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -532,10 +533,126 @@ async def launch_and_watch_pod(spec: WorkerSpec) -> WorkerResult:
     )
 
 
+def _resolve_host_node_ip(core) -> str:
+    """Return the InternalIP address of any Ready node on the cluster `core`
+    points at.
+
+    P3 multi-endpoints fix: a Karmada member cluster is a separate Kubernetes
+    cluster with its own DNS, so WorkerSpec.minio_endpoint/
+    mlflow_tracking_uri -- in-cluster DNS names belonging to the *host*
+    cluster -- never resolve there (this is exactly the live-gate failure:
+    NameResolutionError on mlflow-service.active-fed.svc.cluster.local from
+    inside a member pod). Every kind cluster in this project's multi-cluster
+    environment shares one Docker bridge network, so a member pod *can*
+    reach the host's MinIO/MLflow NodePorts via the host's own node IP
+    (verified live: curl http://172.18.0.2:30500/ -> 200). `core` must be the
+    CoreV1Api this module's own `_k8s_batch_and_core()` builds -- pointed at
+    the host cluster the Temporal worker pod itself runs on, never the
+    Karmada apiserver `dispatch.py._karmada_clients()` builds, since a node
+    IP is only meaningful read from the API of the cluster it belongs to.
+
+    Resolved fresh on every call rather than read from config: the IP is not
+    stable across a kind/VM restart (observed live: 172.18.0.3 before a
+    restart, 172.18.0.2 after), and this project has repeatedly been bitten
+    by exactly this class of stale-value-in-config bug.
+
+    Raises RuntimeError naming exactly what could not be resolved (the node
+    listing call itself failing, zero nodes, no Ready node, or a Ready node
+    with no InternalIP) rather than falling back to any default -- a silent
+    fallback here would reproduce the original in-cluster-DNS failure as an
+    unreachable IP, discovered only after a full POD_WATCH_TIMEOUT_S, instead
+    of an immediate and actionable error.
+    """
+    try:
+        nodes = core.list_node().items
+    except Exception as e:
+        raise RuntimeError(
+            "topology='multi' could not resolve a host node IP for the "
+            f"MinIO/MLflow NodePort rewrite: listing nodes on the host cluster "
+            f"failed: {e}"
+        ) from e
+
+    if not nodes:
+        raise RuntimeError(
+            "topology='multi' could not resolve a host node IP for the "
+            "MinIO/MLflow NodePort rewrite: the host cluster's API returned "
+            "zero nodes"
+        )
+
+    for node in nodes:
+        conditions = {c.type: c.status for c in (node.status.conditions or [])}
+        if conditions.get("Ready") != "True":
+            continue
+        for addr in node.status.addresses or []:
+            if addr.type == "InternalIP":
+                return addr.address
+
+    names = [n.metadata.name for n in nodes]
+    raise RuntimeError(
+        "topology='multi' could not resolve a host node IP for the MinIO/"
+        f"MLflow NodePort rewrite: no Ready node exposes an InternalIP address "
+        f"(checked {names})"
+    )
+
+
+def _rewrite_endpoints_for_multi(spec: WorkerSpec) -> WorkerSpec:
+    """Rewrite spec's MinIO endpoint and MLflow tracking URI onto the host
+    node's NodePorts, for topology='multi' only.
+
+    WorkerSpec is a frozen dataclass (Temporal replays workflow arguments, so
+    immutability keeps replay deterministic) -- dataclasses.replace returns a
+    new instance with only these two fields changed rather than mutating
+    spec in place. Called once, at dispatch time, from
+    _launch_and_watch_pod_multi -- before dispatcher_for(spec).ensure_job
+    ever calls build_job_manifest(spec), so the rewritten values are what
+    actually lands in the worker Job's env, not the unreachable in-cluster
+    DNS names WorkerSpec carries by default.
+
+    spec.minio_nodeport/mlflow_nodeport (types.py) must both be configured
+    (nonzero) -- this is checked before the node lookup runs, so a
+    misconfigured spec fails immediately with a clear message naming which
+    value is missing, rather than resolving a real node IP only to build a
+    silently-broken "<ip>:0" endpoint.
+    """
+    if not spec.minio_nodeport or not spec.mlflow_nodeport:
+        # ValueError, not RuntimeError: a deterministic input-validation
+        # failure exactly like job_name_for's kfp_run_id check above -- every
+        # retry would rebuild the identical spec and fail identically, so
+        # this is listed non-retryable in workflows.py
+        # (non_retryable_error_types=["ValueError"]) to fail fast instead of
+        # burning retry backoff on an outcome that cannot change.
+        raise ValueError(
+            "topology='multi' requires minio_nodeport and mlflow_nodeport to be "
+            "configured (nonzero) to rewrite the worker's MinIO/MLflow "
+            f"endpoints onto the host node's NodePorts; got "
+            f"minio_nodeport={spec.minio_nodeport!r}, "
+            f"mlflow_nodeport={spec.mlflow_nodeport!r}"
+        )
+
+    _, core = _k8s_batch_and_core()
+    host_ip = _resolve_host_node_ip(core)
+    return dataclasses.replace(
+        spec,
+        minio_endpoint=f"{host_ip}:{spec.minio_nodeport}",
+        mlflow_tracking_uri=f"http://{host_ip}:{spec.mlflow_nodeport}",
+    )
+
+
 async def _launch_and_watch_pod_multi(spec: WorkerSpec) -> WorkerResult:
-    """topology='multi': dispatch to spec.member_cluster via Karmada, then
-    wait on the MinIO completion artifact rather than watching the pod --
-    the host cannot reliably watch a pod on a member cluster (dispatch.py).
+    """topology='multi': rewrite spec's MinIO/MLflow endpoints onto the host
+    node's NodePorts, dispatch to spec.member_cluster via Karmada, then wait
+    on the MinIO completion artifact rather than watching the pod -- the
+    host cannot reliably watch a pod on a member cluster (dispatch.py).
+
+    The endpoint rewrite (_rewrite_endpoints_for_multi) happens first, and
+    exactly once per activity invocation: spec.minio_endpoint/
+    mlflow_tracking_uri default to in-cluster DNS names that belong to the
+    host cluster and never resolve from a Karmada member cluster's own DNS
+    -- see _resolve_host_node_ip for the full story. Every subsequent use of
+    `spec` in this function (dispatch, MinIO polling) uses the rewritten
+    version, so the Job manifest build_job_manifest produces inside
+    dispatcher.ensure_job carries the reachable NodePort endpoints, not the
+    unreachable originals.
 
     The Karmada aggregated API is consulted only as best-effort failure
     enrichment, inside a try/except that can never turn a real failure into
@@ -558,6 +675,7 @@ async def _launch_and_watch_pod_multi(spec: WorkerSpec) -> WorkerResult:
 
     from src.orchestration.dispatch import dispatcher_for
 
+    spec = _rewrite_endpoints_for_multi(spec)
     not_before = datetime.now(timezone.utc)
 
     dispatcher = dispatcher_for(spec)
