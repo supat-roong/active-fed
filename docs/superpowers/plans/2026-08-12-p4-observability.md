@@ -66,7 +66,7 @@ If during implementation you find yourself wanting one of these, stop and raise 
 
 **Source material:** `fed-twin/setup/install_multi_cluster_local.sh:236-296` already installs the Karmada Dashboard, exposes it on NodePort 32000, creates `karmada-admin-sa` in the federation context, and prints a 24-hour token. Port that faithfully; it works today.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/dashboard.bats` should cover:
 - `fed_k8s_dashboard_install` applies the upstream manifest pinned to the requested version, and applies the admin ServiceAccount template.
@@ -78,21 +78,21 @@ If during implementation you find yourself wanting one of these, stop and raise 
 
 Note the token function returns a credential on stdout: assert it is **not** written to `$STUB_LOG` or any file, so it cannot leak into logs.
 
-- [ ] **Step 2: Implement `lib/dashboard.sh`**
+- [x] **Step 2: Implement `lib/dashboard.sh`**
 
 Follow library conventions exactly: dry-run guard first, existence probe for idempotency, `|| return 1` on every external command, no `set -euo pipefail`.
 
 For the token function, log a redacted line (`fed_log "created 24h dashboard token (not logged)"`) and print the token itself only on stdout, so a caller can capture it deliberately.
 
-- [ ] **Step 3: Write `manifests/dashboard-admin.yaml.tpl`**
+- [x] **Step 3: Write `manifests/dashboard-admin.yaml.tpl`**
 
 A ServiceAccount plus a `cluster-admin` ClusterRoleBinding, namespaced by `${FED_NAMESPACE}`. Add a comment noting this is a **local development convenience** and would be inappropriate in a shared cluster — `cluster-admin` for a dashboard SA is deliberate here and nowhere else.
 
-- [ ] **Step 4: Add config defaults, whitelist entries, kind port mappings**
+- [x] **Step 4: Add config defaults, whitelist entries, kind port mappings**
 
 Add all five variables to `fed_config_defaults` and its export list, add the two `NODEPORT`/`HOSTPORT` pairs to `FED_TEMPLATE_VARS`, and add the mappings to `kind/single-cluster.yaml.tpl` and `kind/multi-host.yaml.tpl`.
 
-- [ ] **Step 5: Wire into dispatch**
+- [x] **Step 5: Wire into dispatch**
 
 In `lib/components.sh`, after the existing component blocks:
 
@@ -108,7 +108,7 @@ In `lib/components.sh`, after the existing component blocks:
 
 Add `dashboard` to the module list in both `bin/*`, and add dashboard URLs to `fed_up_summary` using the `if fed_has_component …; then … fi` form.
 
-- [ ] **Step 6: Confirm goldens are unchanged, run tests, commit**
+- [x] **Step 6: Confirm goldens are unchanged, run tests, commit**
 
 The dashboards render no manifests into the render dir, so `git diff tests/golden/` must be empty. If anything moved, investigate before committing.
 
@@ -143,19 +143,19 @@ Sets MLflow tags `kfp_run_id`, `temporal_workflow_id`, `topology`, `kfp_run_url`
 
 **Why this matters:** without it, answering "this reward curve looks wrong — which worker failed?" means manually correlating three UIs by timestamp. With it, an MLflow run links straight to its DAG and its fleet.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Cover: all five tags are set; URLs are well-formed and contain the corresponding IDs; empty IDs are skipped rather than written as empty tags; and an MLflow failure is caught and logged rather than aborting the pipeline — tracking must never fail a training run. Use a fake/monkeypatched `mlflow.set_tags`.
 
-- [ ] **Step 2: Implement `log_run_context`**
+- [x] **Step 2: Implement `log_run_context`**
 
 Wrap the whole body in `try`/`except` with a warning, matching the defensive style already used in `fed-twin/src/core/tracking.py:39-46`. Skip empty values instead of writing empty tags.
 
-- [ ] **Step 3: Call it from `evaluate_global`**
+- [x] **Step 3: Call it from `evaluate_global`**
 
 `evaluate_global` already opens an MLflow run per round (`active_fl_pipeline.py:430`). Add the call inside that run, threading `kfp_run_id` (from `dsl.PIPELINE_JOB_ID_PLACEHOLDER`) and the `temporal_workflow_id` that `train_workers` writes into its `worker_report` artifact — read it from the report the aggregator already receives.
 
-- [ ] **Step 4: Print the Temporal URL from `train_workers`**
+- [x] **Step 4: Print the Temporal URL from `train_workers`**
 
 After starting the workflow, print a clickable line into the KFP node logs:
 
@@ -165,11 +165,11 @@ Temporal workflow: http://localhost:8233/namespaces/default/workflows/<id>
 
 That single line closes the KFP → Temporal direction, which is the one a user follows most often when a round looks wrong.
 
-- [ ] **Step 5: Carry `kfp_run_id` in the workflow memo**
+- [x] **Step 5: Carry `kfp_run_id` in the workflow memo**
 
 In `TrainRoundWorkflow`, attach `kfp_run_id` as a workflow memo so the reverse direction — Temporal → KFP — is also available from the Temporal UI.
 
-- [ ] **Step 6: Run tests and commit**
+- [x] **Step 6: Run tests and commit**
 
 ---
 
@@ -178,15 +178,15 @@ In `TrainRoundWorkflow`, attach `kfp_run_id` as a workflow memo so the reverse d
 **Files:**
 - Modify: `active-fed/infra.env`, `infra.env.multi`, `README.md`; `fed-twin/infra.env.multi`, `setup/install_multi_cluster_local.sh`, `README.md`; `fed-infra/README.md`
 
-- [ ] **Step 1: Enable the components**
+- [x] **Step 1: Enable the components**
 
 `active-fed/infra.env`: `FED_COMPONENTS` gains `k8s-dashboard`. `infra.env.multi` gains both `k8s-dashboard` and `karmada-dashboard`.
 
-- [ ] **Step 2: Replace `fed-twin`'s inlined dashboard block**
+- [x] **Step 2: Replace `fed-twin`'s inlined dashboard block**
 
 Delete the Karmada Dashboard install, secret creation, NodePort patch and token generation from `setup/install_multi_cluster_local.sh` (currently lines ~236-296), and add `karmada-dashboard` to its `infra.env.multi`. **Verify the token is still printed** — that is how the user logs in, and losing it would make the dashboard useless without an obvious error. If the library's `fed_dashboard_token` output is not surfaced by `fed-infra-up`, call it explicitly from the consumer script.
 
-- [ ] **Step 3: Document the four surfaces**
+- [x] **Step 3: Document the four surfaces**
 
 In `active-fed/README.md`, a table:
 
@@ -202,13 +202,13 @@ Plus a short "start from a bad reward curve" walkthrough: open the MLflow run �
 
 In `fed-infra/README.md`, document the two dashboard components and the security note that the admin binding is a local-development convenience.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ---
 
 ## Task 4: Phase gate
 
-- [ ] **Step 1: Single-cluster bring-up with dashboards**
+- [x] **Step 1: Single-cluster bring-up with dashboards**
 
 ```bash
 cd active-fed && make local-teardown || true && make local-setup
@@ -217,23 +217,23 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:8443
 
 Expected: `200` or `401` (the dashboard requires a token — either proves it is serving).
 
-- [ ] **Step 2: Token works**
+- [x] **Step 2: Token works**
 
 Generate a token via the library function and confirm it authenticates against the dashboard.
 
-- [ ] **Step 3: Cross-links resolve**
+- [x] **Step 3: Cross-links resolve**
 
 Run a 2-round pipeline. In MLflow, confirm each round's run carries all five tags. Follow `temporal_workflow_url` and confirm it opens the correct workflow. Follow `kfp_run_url` and confirm it opens the correct run. **Follow them by actually opening the URLs**, not by inspecting the strings — a plausible-looking URL that 404s is the failure mode here.
 
-- [ ] **Step 4: Multi-cluster dashboards**
+- [x] **Step 4: Multi-cluster dashboards**
 
 `make multi-setup`, then confirm the Karmada Dashboard serves on 32000, the token authenticates, and member clusters appear healthy.
 
-- [ ] **Step 5: `fed-twin` multi-cluster still works after the dashboard move**
+- [x] **Step 5: `fed-twin` multi-cluster still works after the dashboard move**
 
 `make multi-cluster-setup`, confirm the dashboard is reachable and the token is printed, then `./run_pipeline.sh fed_twin_multi_cluster` reaches `Succeeded`.
 
-- [ ] **Step 6: Confirm the gate**
+- [x] **Step 6: Confirm the gate**
 
 P4 is complete when: both dashboards deploy as `fed-infra` components in both profiles; tokens authenticate; every MLflow run carries all five cross-link tags and both URLs resolve to the correct pages when opened; `fed-twin`'s multi-cluster path works with the dashboard supplied by the library and still prints its token; all prior gates still pass; and `fed-infra`'s `make check` is green with goldens unchanged.
 
