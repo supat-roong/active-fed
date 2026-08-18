@@ -295,3 +295,140 @@ informational rather than a scored finding against Task 3.
   of it. Existing test `test_single_topology_worker_spec_ignores_member_count_and_prefix`
   covers the field-level case; I additionally confirmed no diff exists in the
   actual single-topology code path since before `fbb80f0`.
+
+---
+
+## Fixes applied
+
+Findings 2 and 3 below, plus a Task-4-review Finding 1 fix that also lives
+in `dispatch.py` (this task's file). Finding 1 is addressed with a
+documented "accepted, with rationale" decision, not a code change (see
+Finding 1's own section, above) — the task brief's own worked example of
+verifying an assessment rather than following it, and the assessment held
+up. Finding 4 was already fixed elsewhere before this session (see its own
+section). Four atomic commits on `main`; full suite: 184 -> 203 passed.
+
+### p3-task-4-review.md Finding 1 (repair a terminally-failed Karmada Job before a retry re-attaches)
+
+`KarmadaJobDispatcher._ensure_job_with` (`dispatch.py`) swallowed a 409 on
+`create_namespaced_job` and always returned the existing Job's name --
+unconditional re-attach, even to a Job a previous Temporal attempt had
+already left terminally `Failed`. Since Job names are deterministic
+(`job_name_for`), every one of Temporal's retry attempts hit this exact
+path, each burning the full `POD_WATCH_TIMEOUT_S` polling MinIO for an
+artifact a dead Job can never produce.
+
+Mirrors `activities._ensure_job` (the single-topology fix for the identical
+bug, F5): on 409, classify the existing Job and only delete-and-recreate it
+if terminally failed, otherwise re-attach. The Karmada-specific piece is
+that status for a *propagated* Job comes from the Karmada aggregated API,
+not a local read -- reused via `activities._karmada_job_status` (the same
+helper `_karmada_failure_reason`/`_karmada_terminal_failure` already share)
+rather than a second status-reading path, so an absent/lagging aggregated
+status (Karmada hasn't propagated/observed the Job yet -- normal for the
+first few seconds after dispatch) is treated exactly like "still running,"
+never as failure. The delete-then-wait reuses `activities._await_job_deleted`
+so the recreate can't race a half-deleted Job; the already-existing
+PropagationPolicy is left untouched, since it selects the Job by its
+deterministic name and keeps re-propagating whichever Job currently has
+that name. `ensure_job` is now `async` end-to-end (the `JobDispatcher`
+Protocol, both dispatchers, and the one call site in `activities.py`) to
+allow the delete-then-poll-until-gone wait without blocking the event loop.
+
+Tests added to `tests/test_dispatch.py`:
+`test_karmada_dispatcher_ensure_job_reattaches_to_a_still_active_existing_job`
+(a retry against a live Job re-attaches, never deletes),
+`test_karmada_dispatcher_ensure_job_deletes_and_recreates_a_terminally_failed_job`
+(a retry against a terminally-failed Job deletes, waits, and recreates),
+`test_karmada_dispatcher_ensure_job_does_not_delete_on_absent_or_lagging_status`
+and `test_karmada_dispatcher_ensure_job_does_not_delete_when_karmada_unreachable`
+(the critical safety property: absent/lagging/unreachable aggregated status
+must never trigger deletion). Verified each against the pre-fix code (all
+`TypeError` on the now-`await`ed call) and, more precisely, against two
+narrower deliberately-broken variants: one that never consults status at
+all (the "reattach" test correctly caught 0 status reads instead of 1, and
+the "deletes and recreates" test correctly caught the missing delete call),
+and one that treats *any* non-"running" outcome (including `None`) as
+failed (both "does not delete" tests correctly caught the resulting
+over-eager delete).
+
+Commit: `fix(orchestration): repair a terminally-failed Karmada Job before a
+retry re-attaches`.
+
+### Finding 2 (whitespace and RFC-1123-invalid member cluster names)
+
+`dispatch.py`'s `build_propagation_policy`/`dispatcher_for` and `types.py`'s
+`RoundSpec._member_cluster_for` all used `if not x:` truthiness, so
+`"   "`/`"\t\n"` sailed through untouched. Both now validate the full RFC
+1123 label/prefix character-class format (a small regex in each module --
+`types.py` stays stdlib-only for the Temporal workflow sandbox, and stdlib
+`re` is fine there), not just blankness, and raise outright rather than
+stripping-and-accepting.
+
+**Validation choice, justified:** reject, don't strip-and-continue. A caller
+that silently trims a value with leading/trailing whitespace would just as
+silently launder whatever upstream bug produced it (a stray newline from a
+shell substitution, a YAML block scalar, ...) instead of surfacing it here,
+next to the offending value -- and this codebase's whole design philosophy
+around this exact safety property (loud, synchronous `ValueError`s at the
+point a bad value would otherwise propagate) is to fail fast and visibly,
+not silently repair and hope. Validating the full character-class format
+(not just non-blankness) was a deliberate extension beyond the letter of
+the finding, because the same "adjacent case" gap applies to any non-blank
+garbage (uppercase, embedded spaces, a leading `-`) -- all of these select
+zero real Karmada clusters exactly like whitespace does, and a fix that
+only special-cased whitespace would leave that class of bug in place.
+
+Tests added: `tests/test_dispatch.py`'s
+`test_build_propagation_policy_raises_on_whitespace_only_member_cluster`,
+`test_build_propagation_policy_raises_on_non_blank_but_invalid_member_cluster`,
+`test_dispatcher_for_multi_topology_with_whitespace_only_member_cluster_raises`;
+`tests/test_orchestration_types.py`'s
+`test_multi_topology_with_whitespace_only_member_prefix_raises`,
+`test_multi_topology_with_non_blank_but_invalid_member_prefix_raises`, and
+a regression guard, `test_multi_topology_with_trailing_hyphen_member_prefix_is_accepted`
+(a prefix may end in `-`, unlike a full label, since `worker_spec()` always
+appends a digit). Verified each fails (`DID NOT RAISE`) against the
+pre-fix `if not x:` guards.
+
+Commit: `fix(orchestration): reject whitespace and RFC-1123-invalid member
+cluster names`.
+
+### Finding 3 (a test that cannot fail)
+
+`test_karmada_job_manifest_reused_unchanged_from_p1` asserted against a
+*fresh*, independent `build_job_manifest(spec)` call instead of what
+`_ensure_job_with` actually applied, because `FakeBatchApi.create_namespaced_job`
+never recorded its `body`. It now does (`FakeBatchApi.applied_body`), and
+the test asserts against that recorded body instead.
+
+Verified the repair matters: reproduced the reviewer's exact scenario
+(monkeyed the dispatcher to apply `backoffLimit=3`,
+`restartPolicy="OnFailure"`, and a different Job name entirely) directly
+against the real `_ensure_job_with`, and confirmed the repaired test now
+fails (`AssertionError`, wrong name) where the original version would have
+stayed green.
+
+Commit: `test(dispatch): assert the Karmada manifest-reuse test against the
+applied body`.
+
+### Verified unchanged
+
+- `topology='single'` is untouched: `LocalJobDispatcher`'s `_ensure_job_with`/
+  `_delete_job_with` (the sync, tested-directly helpers) are byte-for-byte
+  identical to before this session; only the public `ensure_job` wrapper
+  gained an `async` keyword to satisfy the `JobDispatcher` Protocol
+  uniformly, which the single-topology path doesn't even exercise in
+  production (`launch_and_watch_pod`'s single-topology branch calls
+  `activities._ensure_job` directly, never `dispatcher_for`/
+  `LocalJobDispatcher`).
+- `launch_and_watch_pod` still raises (never returns a failed
+  `WorkerResult`) on every failure path, multi-topology included --
+  unaffected by this session's changes, which are confined to
+  `dispatch.py`'s Job-creation branch and its own tests.
+- `backoffLimit: 0` / `restartPolicy: Never` in `build_job_manifest`
+  untouched; `KarmadaJobDispatcher` still applies that manifest unmodified
+  (now verified by Finding 3's repaired test against the actually-applied
+  body, not a parallel construction).
+- `member_count <= 0`'s guard (`types.py`) is untouched -- not weakened to
+  dodge Finding 1, per the task brief's explicit instruction.
