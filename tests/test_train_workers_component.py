@@ -53,7 +53,8 @@ def _base_kwargs(worker_report) -> dict:
         kfp_run_id="abcdef1234", mlflow_tracking_uri="http://mlflow:5000",
         mlflow_experiment_name="exp", minio_endpoint="minio:9000",
         minio_access_key="a", minio_secret_key="b", minio_bucket="bkt",
-        worker_image="img:v1", worker_report=worker_report,
+        worker_image="img:v1", topology="single", members=0,
+        member_prefix="active-fed-member", worker_report=worker_report,
     )
 
 

@@ -177,3 +177,52 @@ def test_init_global_model_precedes_the_first_train_workers(tmp_path):
         f"train-workers must depend on {init_task}, "
         f"got dependentTasks={first_train.get('dependentTasks')}"
     )
+
+
+# ---------------------------------------------------------------------------
+# P3 Task 5: topology/members threaded into the pipeline. RoundSpec.worker_spec
+# (types.py) does the actual round-robin assignment; this only guards that the
+# pipeline actually carries the two parameters that drive it, and that the
+# three layers which each hold a default for them (config/k8s.yaml,
+# run_pipeline.py's own fallback, and this pipeline's own dsl parameter
+# default) agree -- the same "silently decorative parameter" trap Finding 1
+# (start_round, above) already burned this file once.
+# ---------------------------------------------------------------------------
+
+
+def test_compiled_pipeline_carries_topology_and_members(tmp_path):
+    text = _compile(tmp_path)
+    spec = yaml.safe_load(text)
+    params = spec["root"]["inputDefinitions"]["parameters"]
+    assert "topology" in params, sorted(params)
+    assert "members" in params, sorted(params)
+
+
+def test_topology_and_members_default_layers_agree(tmp_path):
+    from src.pipelines.run_pipeline import DEFAULT_MEMBERS, DEFAULT_TOPOLOGY
+
+    # Layer 1: config/k8s.yaml -- the value actually authored there today.
+    with open(_REPO_ROOT / "config" / "k8s.yaml") as f:
+        cfg = yaml.safe_load(f)
+    orch = cfg.get("orchestration", {})
+    assert orch.get("topology", DEFAULT_TOPOLOGY) == DEFAULT_TOPOLOGY
+    assert orch.get("members", DEFAULT_MEMBERS) == DEFAULT_MEMBERS
+
+    # Layer 3: active_fl_pipeline's own dsl parameter default, read from the
+    # compiled IR (same technique as test_run_uid_default_is_a_valid_job_name_
+    # for_fragment above -- @dsl.pipeline wraps the function into a
+    # GraphComponent, so inspect.signature no longer exposes the declared
+    # parameter defaults; the compiled pipeline_spec is the ground truth).
+    # This is what applies when run_pipeline.py isn't the caller (e.g. `make
+    # compile-pipeline`).
+    text = _compile(tmp_path)
+    spec = yaml.safe_load(text)
+    params = spec["root"]["inputDefinitions"]["parameters"]
+    assert params["topology"]["defaultValue"] == DEFAULT_TOPOLOGY, (
+        "active_fl_pipeline's topology default disagrees with run_pipeline.py's "
+        "DEFAULT_TOPOLOGY -- exactly the layer-disagreement Finding 1 warned about"
+    )
+    assert params["members"]["defaultValue"] == DEFAULT_MEMBERS, (
+        "active_fl_pipeline's members default disagrees with run_pipeline.py's "
+        "DEFAULT_MEMBERS -- exactly the layer-disagreement Finding 1 warned about"
+    )

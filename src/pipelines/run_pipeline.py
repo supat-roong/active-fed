@@ -15,6 +15,18 @@ from kfp import Client
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
+# P3: fallback defaults for orchestration.topology / orchestration.members
+# when config/k8s.yaml doesn't set them. Named constants (not inline
+# literals) so they can be compared directly against active_fl_pipeline's own
+# dsl parameter defaults -- see test_topology_and_members_default_layers_agree
+# in tests/test_active_fl_pipeline.py. A prior review found a parameter that
+# was silently decorative because these layers disagreed (P2 review Finding
+# 1, start_round); this pins the three layers (config, this fallback, the
+# pipeline signature) to the same value instead of three separately-typed
+# literals that can drift apart unnoticed.
+DEFAULT_TOPOLOGY = "single"
+DEFAULT_MEMBERS = 0
+
 
 def compute_start_round(minio_client, bucket: str) -> int:
     """Highest round N for which round_N/global.pt exists, else 0.
@@ -141,6 +153,8 @@ def main():
     temporal_address = orch.get(
         "temporal_address", "temporal-frontend.active-fed.svc.cluster.local:7233"
     )
+    topology = orch.get("topology", DEFAULT_TOPOLOGY)
+    members = orch.get("members", DEFAULT_MEMBERS)
     seed = exp.get("seed", 42)
 
     combos = cfg.get("combinations", [{"weight_mode": "active", "active_data_mode": "bc"}])
@@ -259,6 +273,8 @@ def main():
             "mlflow_experiment_name": run_name,
             "minio_bucket": bucket_name,
             "temporal_address": temporal_address,
+            "topology": topology,
+            "members": members,
             "run_uid": run_uid,
             "seed": seed,
             # P2 review fix wave, Finding 1: start_round is NOT passed here.
