@@ -248,7 +248,7 @@ The Karmada Dashboard and the admin-token step are `fed-twin`-specific presentat
 
 **Cap at 2 members.** Expect this to be slow and memory-hungry; a full bring-up may take 45+ minutes.
 
-- [ ] **Step 1: `active-fed` multi bring-up**
+- [x] **Step 1: `active-fed` multi bring-up**
 
 ```bash
 make multi-teardown || true
@@ -259,23 +259,23 @@ kubectl --kubeconfig ~/.karmada/karmada-apiserver.config get clusters
 
 Expected: three kind clusters; all three joined and `Ready` in Karmada.
 
-- [ ] **Step 2: Run a 2-round, 2-worker pipeline**
+- [x] **Step 2: Run a 2-round, 2-worker pipeline**
 
 Confirm: `PropagationPolicy` objects exist on the Karmada apiserver; each member cluster runs exactly one worker pod (`kubectl --context kind-active-fed-member1 get pods`); the aggregator collects both workers' updates; MLflow records the round.
 
-- [ ] **Step 3: Prove members are genuinely separate**
+- [x] **Step 3: Prove members are genuinely separate**
 
 Confirm no worker pod ran on the host cluster: `kubectl --context kind-active-fed-host get pods -l app=active-fl-worker` returns nothing.
 
-- [ ] **Step 4: Prove MinIO-based completion works without cross-cluster log access**
+- [x] **Step 4: Prove MinIO-based completion works without cross-cluster log access**
 
 Confirm the aggregator succeeded without any kubeconfig secret existing — `kubectl get secret -n active-fed | grep -c karm` should be 0 apart from the one mounted into the Temporal worker.
 
-- [ ] **Step 5: `fed-twin` multi-cluster still works**
+- [x] **Step 5: `fed-twin` multi-cluster still works**
 
 `make multi-cluster-teardown && make multi-cluster-setup`, then `./run_pipeline.sh fed_twin_multi_cluster` reaches `Succeeded`.
 
-- [ ] **Step 6: Confirm the gate**
+- [x] **Step 6: Confirm the gate**
 
 P3 is complete when: both consumers' multi-cluster paths come up on `fed-infra`; `active-fed` runs a federated round with workers on separate member clusters; no cross-cluster log-following or kubeconfig-secret machinery exists in `active-fed`; `fed-twin`'s multi-cluster pipeline still succeeds; both single-cluster paths still pass their P0/P1 gates; `fed-infra`'s `make check` is green including the new `consumer-c` goldens.
 
