@@ -49,6 +49,16 @@ round_1/workers/worker_{0,1}_{delta.pt,metrics.json,weights.pt}
 Both workers' updates collected in both rounds, and `round_1/global.pt`
 proves the aggregator ran on round 0's collected results.
 
+**Scope of this listing, stated precisely:** it was captured while the run was
+still in progress, so it does not include the final `round_2/global.pt` (round
+N's file is the *input* model for round N, so round 2's is the product of
+aggregating round 1). The workflow reached `Succeeded` afterwards, which
+implies that step ran, but the artifact itself was never listed and the
+cluster has since been torn down. The single-cluster regression below, run to
+completion before listing, does show the final `round_2/global.pt` -- treat
+that as the confirmed shape of a finished run, and this multi listing as
+verified-through-round-1 plus a `Succeeded` workflow.
+
 Karmada secrets in the `active-fed` namespace: only `karmada-kubeconfig`,
 the one mounted into the Temporal worker.
 
@@ -92,3 +102,32 @@ named the exact ServiceAccount and permission instead of timing out.
 The Docker disk filled twice (79G, 100%), which presents as slow pulls and
 regressing pod counts. `crictl pull` by hand and `df` on the *docker*
 filesystem -- not the VM root -- is the fast diagnosis. Grown to 118G.
+
+---
+
+# Single-cluster regression (P0/P1/P2 paths, after the P3 changes)
+
+Run: KFP `active-fl-cartpole-sfd8q`, **Succeeded** in 4m51s
+Config: single topology, 2 rounds, 2 workers.
+
+P3 changed `activities.py`, `dispatch.py` and `types.py`, all shared with the
+single path, plus the fed-infra libraries beneath it. Unit tests and byte-level
+diffs said single was unaffected, but the earlier gates were passed by live
+runs, so only a live run re-establishes them.
+
+- `make local-setup`: `REAL EXIT: 0`, clean on the first attempt
+- Both workers ran on the one cluster; no propagation, no Karmada involvement
+- No worker-side exceptions
+- Full artifact set including the final aggregation:
+
+```
+round_0/global.pt + round_0/workers/worker_{0,1}_{delta,metrics,weights}
+round_1/global.pt + round_1/workers/worker_{0,1}_{delta,metrics,weights}
+round_2/global.pt          <- final model, after aggregating round 1
+```
+
+Incidentally this also exercised the fed-infra fixes against the single
+profile: the raised pod-readiness budget absorbed a cold image pull (visible
+as `attempt N/30`, where the old ceiling was 12), Temporal correctly took the
+*install* path rather than the new skip path on a fresh cluster, and the
+Karmada datastore probe never fired.
