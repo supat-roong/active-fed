@@ -12,13 +12,14 @@ from src.orchestration.types import RoundSpec, WorkerResult, WorkerSpec
 from src.orchestration.workflows import TASK_QUEUE, TrainRoundWorkflow, WorkerWorkflow
 
 
-def _round_spec(num_workers=3, min_workers=2) -> RoundSpec:
+def _round_spec(num_workers=3, min_workers=2, kfp_backend_run_id="") -> RoundSpec:
     return RoundSpec(
         fl_round=0, num_workers=num_workers, min_workers=min_workers, local_episodes=5,
         namespace="ns", worker_image="img:v1", minio_endpoint="m:9000",
         minio_access_key="a", minio_secret_key="b", minio_bucket="bkt",
         mlflow_tracking_uri="http://mlflow:5000", mlflow_experiment_name="exp",
         kfp_run_id="abcdef1234",
+        kfp_backend_run_id=kfp_backend_run_id,
     )
 
 
@@ -371,12 +372,46 @@ async def test_train_round_workflow_memo_carries_kfp_run_id():
             workflows=[TrainRoundWorkflow, WorkerWorkflow], activities=[launch, cleanup],
         ):
             handle = await env.client.start_workflow(
-                TrainRoundWorkflow.run, _round_spec(),
+                TrainRoundWorkflow.run,
+                # kfp_run_id ("abcdef1234") is run_uid, which names Jobs but
+                # does not resolve in KFP's UI. The memo must carry the backend
+                # id instead -- a memo built from run_uid links nowhere while
+                # looking correct, which is exactly what the live P4 gate found.
+                _round_spec(kfp_backend_run_id="3b66067f-040b-461f-8b1a-a153cc6a13b4"),
                 id=f"t-{uuid.uuid4()}", task_queue=TASK_QUEUE,
             )
             await handle.result()
             desc = await handle.describe()
-    assert await desc.memo_value("kfp_run_id") == "abcdef1234"
+    assert await desc.memo_value("kfp_run_id") == "3b66067f-040b-461f-8b1a-a153cc6a13b4"
+
+
+@pytest.mark.asyncio
+async def test_train_round_workflow_skips_the_memo_when_the_backend_id_is_unknown():
+    """No memo beats a memo pointing at a run KFP cannot find."""
+
+    @activity.defn(name="launch_and_watch_pod")
+    async def launch(spec: WorkerSpec) -> WorkerResult:
+        return _ok(spec)
+
+    @activity.defn(name="cleanup_worker_job")
+    async def cleanup(spec: WorkerSpec) -> None:
+        return None
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE,
+            workflows=[TrainRoundWorkflow, WorkerWorkflow], activities=[launch, cleanup],
+        ):
+            handle = await env.client.start_workflow(
+                TrainRoundWorkflow.run, _round_spec(),  # kfp_backend_run_id defaults to ""
+                id=f"t-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            await handle.result()
+            desc = await handle.describe()
+    # memo_value raises rather than returning None when the key is absent --
+    # which is the assertion: nothing was written at all.
+    with pytest.raises(KeyError):
+        await desc.memo_value("kfp_run_id")
 
 
 @pytest.mark.asyncio

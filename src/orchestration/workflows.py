@@ -129,8 +129,12 @@ class TrainRoundWorkflow:
         # and upsert_memo is a workflow command, not I/O. Skipped when empty
         # for the same reason log_run_context skips empty ids -- an empty
         # memo value is worse than no memo entry.
-        if spec.kfp_run_id:
-            workflow.upsert_memo({"kfp_run_id": spec.kfp_run_id})
+        # kfp_backend_run_id, not kfp_run_id: the latter holds run_uid, which
+        # names Jobs but does not resolve in KFP's UI, so a memo built from it
+        # linked nowhere while looking correct (seen live: memo value
+        # "23859aa5" against a real run id of 3b66067f-...).
+        if spec.kfp_backend_run_id:
+            workflow.upsert_memo({"kfp_run_id": spec.kfp_backend_run_id})
 
         async def _one(worker_id: int) -> WorkerResult:
             self._statuses[worker_id] = WorkerStatus(worker_id=worker_id, phase="Running")

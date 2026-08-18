@@ -151,6 +151,7 @@ def train_workers(
 
     from src.orchestration.types import RoundSpec
     from src.orchestration.workflows import TASK_QUEUE, TrainRoundWorkflow
+    from src.tracking.mlflow_logger import kfp_run_id_from_artifact_uri
 
     spec = RoundSpec(
         fl_round=fl_round,
@@ -171,6 +172,14 @@ def train_workers(
         member_prefix=member_prefix,
         minio_nodeport=minio_nodeport,
         mlflow_nodeport=mlflow_nodeport,
+        # KFP stamps its own run id into the URIs of the artifacts it mints,
+        # and worker_report is one of ours, so the id KFP's UI resolves is
+        # recoverable right here. Used only for the workflow memo (the
+        # Temporal -> KFP reverse link) -- never for naming, which stays on
+        # run_uid because a full UUID would exceed the 63-char Job name limit.
+        kfp_backend_run_id=kfp_run_id_from_artifact_uri(
+            getattr(worker_report, "uri", "")
+        ),
     )
 
     async def _run() -> dict:

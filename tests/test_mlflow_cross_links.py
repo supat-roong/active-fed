@@ -361,3 +361,27 @@ def test_evaluate_global_skips_the_kfp_tag_when_the_uri_is_unrecognised(tmp_path
         artifact_uri="/local/path/worker_report",
     )
     assert logged["kfp_run_id"] == ""
+
+
+def test_round_spec_carries_the_backend_run_id_separately_from_the_naming_fragment():
+    """The memo needs KFP's real run id, which is NOT spec.kfp_run_id.
+
+    spec.kfp_run_id holds run_uid, a short fragment job_name_for builds
+    Kubernetes Job names from (`aflw-<run_uid>-r0-w0`); a full KFP UUID there
+    would blow the 63-character name limit. But run_uid does not resolve in
+    KFP's UI, so a memo carrying it links nowhere while looking correct --
+    observed live: the memo key was present and its value was "23859aa5".
+    The two ids serve different purposes and need different fields.
+    """
+    import inspect
+
+    from src.orchestration.types import RoundSpec
+
+    params = inspect.signature(RoundSpec).parameters
+    assert "kfp_backend_run_id" in params, (
+        "RoundSpec has no kfp_backend_run_id, so the workflow memo can only "
+        "carry run_uid, which does not resolve in the KFP UI"
+    )
+    assert params["kfp_backend_run_id"].default == "", (
+        "must default to empty so the memo is skipped rather than wrong"
+    )

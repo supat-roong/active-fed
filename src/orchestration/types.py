@@ -113,6 +113,15 @@ class RoundSpec:
     # RoundSpec-driving field.
     minio_nodeport: int = 0
     mlflow_nodeport: int = 0
+    # KFP's own run id, as used in its UI at /#/runs/details/<id>.
+    # Deliberately separate from kfp_run_id above, which holds run_uid --
+    # a short fragment job_name_for builds Kubernetes Job names from
+    # ("aflw-<run_uid>-r0-w0"), where a full UUID would exceed the
+    # 63-character name limit. run_uid does not resolve in KFP's UI, so
+    # carrying it as the workflow memo linked nowhere while looking
+    # correct (observed live: memo value "23859aa5"). Empty means
+    # "unknown" and the memo is skipped rather than written wrong.
+    kfp_backend_run_id: str = ""
 
     def worker_spec(self, worker_id: int) -> WorkerSpec:
         member_cluster = self.member_cluster
