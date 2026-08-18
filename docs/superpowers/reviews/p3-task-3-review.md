@@ -65,6 +65,48 @@ fields to a dataclass that already crosses the wire), but it is a direct,
 demonstrable defect in what `fbb80f0` shipped, and is exactly the kind of
 thing item 5 of the review brief asked to check.
 
+**Accepted, with rationale (fix session, 2026-08-18).** Verified rather than
+taken on faith: `topology='multi'` has never been run against a real
+cluster, so no in-flight Temporal history containing `topology="multi"` can
+exist for this deserialization gap to break on replay. Independent evidence
+checked directly, not just asserted:
+
+- `config/k8s.yaml`'s `orchestration.topology` default is `single` (and
+  `members: 0`) — nothing runs `multi` unless a caller explicitly overrides
+  it, and nothing in the repo does.
+- `.superpowers/sdd/2026-08-12-p3-karmada-multi-cluster/progress.md` (the
+  session ledger for this phase) records Tasks 1-4 complete; there is no
+  Task 6 or Task 7 report on disk, and the plan document is explicit that
+  **Task 7 is the only task that runs anything against a real cluster**
+  ("Tasks 1-6 need no cluster; Task 7's gate needs host + members"). Task 7
+  has not happened.
+- `git log` on `main` shows nothing resembling a live multi-cluster pipeline
+  run (KFP submission, gate report, etc.) after `fbb80f0` — only further
+  code/test commits and doc updates.
+
+So there is no live workflow history to replay, and the failure mode the
+reviewer demonstrated is a loud, synchronous `ValueError` raised at
+`worker_spec()` construction time (caught by `TrainRoundWorkflow._one`'s
+`try:` and surfaced as an obviously-wrong worker failure message) — not
+silent misbehaviour. Per the task brief's explicit instruction not to weaken
+`member_count <= 0`'s guard to dodge this, and since there is nothing running
+today for it to break, **no code change is made** for this finding.
+
+**What would have to be true for this to matter:** a `RoundSpec` schema
+change (add/remove/rename a field with wire-visible defaults) lands *while a
+`topology="multi"` round is genuinely in-flight* — i.e., after Task 7's gate
+has actually run multi-cluster rounds against a live Temporal deployment,
+with a round's workflow history spanning across the deploy of the schema
+change. At that point this finding's mechanism (old-shaped history
+decoding to the new dataclass's defaults, `0`/`""`, which
+`_member_cluster_for` correctly treats as fatal) becomes a real replay
+hazard, and the fix (a Temporal-safe way to distinguish "old history, field
+absent" from "new history, field genuinely `0`" — e.g. a workflow
+versioning marker, or accepting the old defaults as a distinct "not yet
+migrated" sentinel rather than routing them into the same fatal-empty-value
+check) should be revisited before that gate is exercised for real, not
+deferred again.
+
 ---
 
 ## Finding 2 — MEDIUM/HIGH — CONFIRMED — whitespace-only `member_cluster`/`member_prefix` defeats every "critical safety property" guard
