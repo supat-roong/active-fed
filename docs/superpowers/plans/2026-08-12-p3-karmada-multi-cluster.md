@@ -89,23 +89,23 @@ Karmada on kind means **one cluster per member plus the host**. `config/local.ya
 
 **Port from `fed-twin`, with the fragile parts kept:** `fed-twin/setup/install_multi_cluster_local.sh:111-146` contains a `join_and_patch` function that joins a cluster then rewrites both the `Cluster` object's `apiEndpoint` and the kubeconfig stored in its secret, replacing `127.0.0.1`/`localhost` with the container's Docker-network IP. That rewrite is **essential** — without it the Karmada control plane cannot reach members from inside the host container. Port it faithfully; it is the single most failure-prone part of this phase.
 
-- [ ] **Step 1: Write `tests/stubs/karmadactl`**
+- [x] **Step 1: Write `tests/stubs/karmadactl`**
 
 Same shape as the other stubs: `set -euo pipefail`, log argv to `$STUB_LOG`, honour `STUB_KARMADACTL_FAIL_GLOB` with the `# shellcheck disable=SC2254` comment, emit `STUB_KARMADACTL_OUT`, exit 0.
 
-- [ ] **Step 2: Write `tests/karmada.bats`**
+- [x] **Step 2: Write `tests/karmada.bats`**
 
 Cover: `fed_karmada_init` skips when the `karmada-system` namespace already exists; it passes `--karmada-data`/`--karmada-pki`/`--cert-external-ip`; `fed_karmada_join` skips an already-joined cluster; join patches both the `Cluster` apiEndpoint and the secret; all three functions are no-ops under `FED_DRY_RUN=1`; each fails fast when its underlying command fails.
 
-- [ ] **Step 3: Implement `lib/karmada.sh`**
+- [x] **Step 3: Implement `lib/karmada.sh`**
 
 Port from `fed-twin/setup/install_multi_cluster_local.sh:88-155`, converting to library conventions: dry-run guard first, `|| return 1` after every external command, idempotent existence probes, no `set -euo pipefail`. Keep the Python-based base64 secret rewrite — it is doing real work that `sed` on base64 cannot.
 
-- [ ] **Step 4: Add config defaults and whitelist entries**
+- [x] **Step 4: Add config defaults and whitelist entries**
 
 `FED_MEMBER_COUNT`, `FED_MEMBER_PREFIX`, `FED_KARMADA_VERSION`, `FED_KARMADA_CONFIG` in `fed_config_defaults` + the export list. Add `${FED_MEMBER_COUNT}` and `${FED_MEMBER_PREFIX}` to `FED_TEMPLATE_VARS`.
 
-- [ ] **Step 5: Run tests and commit**
+- [x] **Step 5: Run tests and commit**
 
 ```bash
 make check
@@ -124,21 +124,21 @@ git commit -m "feat: karmada control plane component with member join and endpoi
 **Interfaces:**
 - Produces: `fed_up` branches on `FED_PROFILE`. For `multi`: create the host cluster, create `FED_MEMBER_COUNT` member clusters, install `karmada`, join every cluster, then install the remaining components **on the host only**. `fed_down` deletes host and all members.
 
-- [ ] **Step 1: Write the templates**
+- [x] **Step 1: Write the templates**
 
 `multi-host.yaml.tpl` mirrors `single-cluster.yaml.tpl` including all NodePort mappings — the host runs every shared service. `member.yaml.tpl` is minimal: a control-plane node with **no** `extraPortMappings`, since members only run worker pods and reach the host over its NodePorts.
 
-- [ ] **Step 2: Branch `fed_up` on profile**
+- [x] **Step 2: Branch `fed_up` on profile**
 
 Keep the single-profile path exactly as it is. Add a `multi` branch that creates the host, loops `FED_MEMBER_COUNT` members via `fed_kind_ensure_cluster "${FED_MEMBER_PREFIX}${i}" member.yaml.tpl`, loads `FED_IMAGES` into **every** cluster (workers run on members), then switches context to the host before installing kfp/training/temporal/minio/mlflow.
 
 Guard the whole branch under dry-run the same way as everything else, and add a `consumer-c` golden fixture so the multi profile's rendered manifests are diffed like the others.
 
-- [ ] **Step 3: Extend `fed_down`**
+- [x] **Step 3: Extend `fed_down`**
 
 Delete members first, then the host. Deleting the host first orphans member clusters that still reference it.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 ```bash
 make check
@@ -170,19 +170,19 @@ def dispatcher_for(spec: WorkerSpec) -> JobDispatcher: ...
 def build_propagation_policy(spec: WorkerSpec) -> dict: ...   # pure, testable
 ```
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Test `build_propagation_policy` as a pure function: it targets the Job by the deterministic name from P1; `clusterAffinity.clusterNames` contains exactly `spec.member_cluster`; the policy name is deterministic and a valid Kubernetes name; `dispatcher_for` returns `LocalJobDispatcher` for `topology="single"` and `KarmadaJobDispatcher` for `"multi"`; and a `multi` spec with an empty `member_cluster` raises rather than silently propagating everywhere.
 
 That last case matters: an empty `clusterNames` list in Karmada means *all* clusters, so a missing member name would run every worker on every member.
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 `LocalJobDispatcher` wraps the P1 code path unchanged. `KarmadaJobDispatcher` applies both the Job and the `PropagationPolicy` against the Karmada apiserver, using a kubeconfig path from `FED_KARMADA_CONFIG` mounted into the Temporal worker pod. Assign members round-robin: `member_cluster = f"{prefix}{worker_id % member_count + 1}"`, computed in `RoundSpec.worker_spec`.
 
 Because `physics_seed` derives from `worker_id`, one member cluster maps to one physical variation — which is the geo-distributed fleet narrative the project is demonstrating.
 
-- [ ] **Step 3: Run tests and commit**
+- [x] **Step 3: Run tests and commit**
 
 ---
 
@@ -197,15 +197,15 @@ Because `physics_seed` derives from `worker_id`, one member cluster maps to one 
 
 **Why:** in multi-cluster the worker pod is in another cluster and the host cannot reliably watch it. But the worker writes `round_N/workers/worker_i_metrics.json` on success, so that object's appearance **is** the completion signal — and it is the same signal the aggregator already depends on (`src/aggregator/collect.py:47-56`).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Fake MinIO client. Cover: returns True as soon as the object appears; returns False on timeout; heartbeats each poll; tolerates transient `S3Error` without aborting; and — importantly — does **not** treat the presence of `worker_i_weights.pt` alone as completion, since the worker writes weights before metrics and a partial upload must not be read as success.
 
-- [ ] **Step 2: Implement and wire into the activity**
+- [x] **Step 2: Implement and wire into the activity**
 
 In `launch_and_watch_pod`, branch on topology: `single` keeps the Job-status watch from P1; `multi` uses `wait_for_worker_artifact`, with the Karmada aggregated API consulted only for best-effort failure enrichment inside a `try`/`except` that never masks the real outcome.
 
-- [ ] **Step 3: Run tests and commit**
+- [x] **Step 3: Run tests and commit**
 
 ---
 
@@ -215,15 +215,15 @@ In `launch_and_watch_pod`, branch on topology: `single` keeps the Job-status wat
 - Create: `active-fed/infra.env.multi`
 - Modify: `config/k8s.yaml`, `Makefile`, `k8s/temporal-worker.yaml`
 
-- [ ] **Step 1: Write `infra.env.multi`**
+- [x] **Step 1: Write `infra.env.multi`**
 
 `FED_PROFILE=multi`, `FED_CLUSTER_NAME=active-fed-host`, `FED_MEMBER_COUNT=2`, `FED_MEMBER_PREFIX=active-fed-member`, `FED_COMPONENTS=kfp,training,temporal,minio,mlflow,karmada`, same S3/NodePort values as the single profile.
 
-- [ ] **Step 2: Mount the Karmada kubeconfig into the Temporal worker**
+- [x] **Step 2: Mount the Karmada kubeconfig into the Temporal worker**
 
 The worker pod runs on the host and must reach the Karmada apiserver. Add a Secret created from `${FED_KARMADA_CONFIG}` and mount it, setting `FED_KARMADA_CONFIG` in the container env to the mount path.
 
-- [ ] **Step 3: Add `config/k8s.yaml` keys and Makefile targets, then commit**
+- [x] **Step 3: Add `config/k8s.yaml` keys and Makefile targets, then commit**
 
 ---
 
@@ -240,7 +240,7 @@ The worker pod runs on the host and must reach the Karmada apiserver. Add a Secr
 
 The Karmada Dashboard and the admin-token step are `fed-twin`-specific presentation concerns — leave them in the consumer script rather than moving them into `fed-infra`, unless P4 decides otherwise.
 
-- [ ] **Steps:** write `infra.env.multi`; reduce the script to image builds + `fed-infra-up --env infra.env.multi` + the consumer-specific dashboard/token/propagation pieces; delete the superseded kind config; verify with a dry-run; confirm no `.py` changed; commit.
+- [x] **Steps:** write `infra.env.multi`; reduce the script to image builds + `fed-infra-up --env infra.env.multi` + the consumer-specific dashboard/token/propagation pieces; delete the superseded kind config; verify with a dry-run; confirm no `.py` changed; commit.
 
 ---
 
