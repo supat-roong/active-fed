@@ -156,7 +156,25 @@ example). A future refactor of `_ensure_job_with` that silently diverges from
 
 ---
 
-## Finding 4 — LOW / informational, out of strict diff scope — CONFIRMED-by-grep — `member_prefix` has no config knob and no layer-agreement test
+## Finding 4 — LOW / informational, out of strict diff scope — FIXED DURING REVIEW (commit `12cbd67`) — `member_prefix` had no config knob and no layer-agreement test
+
+**Update**: while this review was in progress, a new commit landed on `main`
+(`12cbd67`, "fix(pipeline): thread member_prefix from config instead of
+hardcoding it") that fixes exactly the gap described below — it adds
+`member_prefix` to `config/k8s.yaml`'s `orchestration:` block, threads it
+through `run_pipeline.py` via a new `DEFAULT_MEMBER_PREFIX`, and adds
+`test_member_prefix_is_threaded_from_config_not_hardcoded` /
+`test_member_prefix_matches_the_multi_infra_contract` to
+`tests/test_active_fl_pipeline.py`, pinning it against
+`infra.env.multi`'s `FED_MEMBER_PREFIX`. So as of current `main`, this is
+resolved; the description below reflects the state at the time this review
+started (i.e. `HEAD` = `26a8854`, the last commit before `12cbd67`), kept for
+the record and because it corroborates the finding was real. This is
+unrelated to and does not affect Findings 1-3, which are about
+`dispatch.py`/`types.py` and are unchanged by `12cbd67`
+(confirmed: `git diff 26a8854 HEAD -- src/orchestration/dispatch.py
+src/orchestration/types.py tests/test_dispatch.py
+tests/test_orchestration_types.py` is empty).
 
 `src/pipelines/active_fl_pipeline.py`'s `train_workers`/pipeline signature
 declares `member_prefix: str = "active-fed-member"`, but:
