@@ -17,6 +17,17 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "pods/log", "services", "endpoints"]
     verbs: ["get", "list", "watch"]
+  # nodes: required by _resolve_host_node_ip (src/orchestration/activities.py)
+  # under topology='multi'. Worker Jobs run on member clusters that cannot
+  # resolve the host's *.svc.cluster.local names, so their MinIO/MLflow
+  # endpoints are rewritten to <host-node-InternalIP>:<NodePort>, and that IP
+  # is read from the host cluster's node list at dispatch time rather than
+  # configured -- a kind node's Docker IP changes across a host restart, so a
+  # written-down value silently points at the wrong container. Read-only, and
+  # unused by topology='single'.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
   - apiGroups: ["batch"]
     resources: ["jobs", "jobs/status"]
     verbs: ["get", "list", "watch", "create", "delete"]

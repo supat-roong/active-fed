@@ -540,3 +540,33 @@ async def test_karmada_dispatcher_tolerates_an_existing_namespace():
     await KarmadaJobDispatcher()._ensure_job_with(batch, custom, spec, core=core)
 
     assert core.created == [], "an already-present namespace must not be recreated"
+
+
+def test_rbac_grants_the_node_access_the_multi_endpoint_rewrite_needs():
+    """k8s/rbac.yaml must allow listing nodes, or topology='multi' cannot dispatch.
+
+    _resolve_host_node_ip reads the host cluster's node InternalIP to rewrite
+    worker MinIO/MLflow endpoints to NodePorts. Without this grant every multi
+    dispatch dies with 403 `nodes is forbidden`, which is exactly how the first
+    run after the rewrite landed failed -- the code and the RBAC that permits
+    it live in different files and nothing tied them together.
+    """
+    import pathlib
+
+    import yaml as _yaml
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    docs = list(_yaml.safe_load_all((root / "k8s" / "rbac.yaml").read_text()))
+    roles = [d for d in docs if d and d.get("kind") == "ClusterRole"]
+    assert roles, "no ClusterRole in k8s/rbac.yaml"
+
+    granted = False
+    for role in roles:
+        for rule in role.get("rules", []):
+            if "" in rule.get("apiGroups", []) and "nodes" in rule.get("resources", []):
+                if "list" in rule.get("verbs", []):
+                    granted = True
+    assert granted, (
+        "no ClusterRole in k8s/rbac.yaml grants list on core/nodes, so "
+        "_resolve_host_node_ip will 403 and every topology='multi' dispatch fails"
+    )
