@@ -45,6 +45,44 @@ def log_round_metrics(
     log.info(f"[MLflow] Round {fl_round} | global_reward={global_eval_reward:.2f}")
 
 
+def log_run_context(
+    kfp_run_id: str,
+    temporal_workflow_id: str,
+    topology: str,
+    kfp_base_url: str = "http://localhost:8080",
+    temporal_base_url: str = "http://localhost:8233",
+) -> None:
+    """Tag the active MLflow run with cross-links to its KFP round and its
+    Temporal worker fleet, so the four observability surfaces (KFP, Temporal,
+    MLflow, Kubernetes Dashboard) can be navigated between instead of
+    correlated by hand across three UIs by timestamp.
+
+    Sets up to five tags: kfp_run_id, kfp_run_url, temporal_workflow_id,
+    temporal_workflow_url, topology. Tracking must never fail a training run
+    that has been going for minutes, so the whole body is wrapped in
+    try/except with a warning on failure -- matching the defensive style of
+    fed-twin/src/core/tracking.py's log_metrics. Empty ids are skipped rather
+    than written as empty tags: an empty kfp_run_id tag is worse than none,
+    because it looks like data.
+    """
+    try:
+        tags: dict[str, str] = {}
+        if kfp_run_id:
+            tags["kfp_run_id"] = kfp_run_id
+            tags["kfp_run_url"] = f"{kfp_base_url}/#/runs/details/{kfp_run_id}"
+        if temporal_workflow_id:
+            tags["temporal_workflow_id"] = temporal_workflow_id
+            tags["temporal_workflow_url"] = (
+                f"{temporal_base_url}/namespaces/default/workflows/{temporal_workflow_id}"
+            )
+        if topology:
+            tags["topology"] = topology
+        if tags:
+            mlflow.set_tags(tags)
+    except Exception as e:
+        log.warning(f"Failed to log MLflow run-context tags: {e}")
+
+
 def log_global_model(
     global_weights: dict[str, torch.Tensor],
     fl_round: int,
