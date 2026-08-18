@@ -79,3 +79,50 @@ Both were in the cross-links, and both would have passed a looser check.
 
 The lesson is the same in both: a tag whose key exists, and a URL that is
 well-formed, are not evidence that either resolves.
+
+## Step 5: fed-twin multi-cluster with the dashboard supplied by the library
+
+Bring-up `make multi-cluster-setup`: **REAL EXIT: 0**
+Run: KFP `federated-twin-multi-cluster-pipeline-s7v6f`, **Succeeded** in 83s
+
+fed-twin's 47 inlined lines (dashboard install, kubeconfig secret, NodePort
+patch, token generation) are gone, replaced by the fed-infra component.
+
+The risk this carried was a **silent capability regression**: the dashboard
+would deploy perfectly and simply be unloggable-into, because
+`fed_dashboard_token` prints to stdout only (so it cannot leak into logs) and
+`fed-infra-up` does not surface it. Verified end to end rather than assumed:
+
+```
+Generating Karmada Dashboard Access Token
+[fed-infra] created 24h dashboard token for karmada-admin-sa in karmada-system (not logged)
+Dashboard Access Token (expires in 24h):
+  -> 1143 chars printed
+```
+
+Both halves hold: the redacted log line proves the token travelled by stdout,
+and the token itself reached the user. Used as the **sole** credential it
+authenticates:
+
+```
+kubectl --server <karmada> --token <token from the run output> get clusters
+  multi-cluster-host / member1 / member2   all READY=True
+```
+
+Pipeline output, 10 metric rows (not the header-only shape a failed scrape
+produces):
+
+```
+round,twin_id,mode,reward,loss
+1,train-twin-2,TRAIN,24.50,-0.0077
+... 10 rows across 2 rounds, 2 train twins and the eval twin
+```
+
+## Gate result
+
+All five steps pass. Both dashboards deploy as fed-infra components in both
+profiles; both tokens authenticate and authorise; every MLflow run carries all
+five cross-link tags and both directions resolve against the APIs that own
+them; fed-twin's multi-cluster path works with the library-supplied dashboard
+and still prints its token; and fed-infra's `make check` is green (198 tests,
+exit 0) with goldens unchanged.
