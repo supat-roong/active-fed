@@ -1,0 +1,89 @@
+# Active-FL Experiment Configuration -- MULTI-CLUSTER topology
+# =============================================================
+# Pairs with infra.env.multi the way config/k8s.yaml pairs with infra.env.
+# Identical to config/k8s.yaml except:
+#   - orchestration.topology: multi, orchestration.members: 2
+#     (workers propagate via Karmada onto active-fed-member1/2; see
+#      RoundSpec.worker_spec in src/orchestration/types.py)
+#   - one combination instead of four -- this config exists to exercise
+#     cross-cluster propagation, not to compare weighting strategies, and
+#     four combinations would submit four pipeline runs
+#   - local_episodes reduced, purely to keep a run tractable; it has no
+#     bearing on what the multi topology demonstrates
+#
+# members MUST equal FED_MEMBER_COUNT in infra.env.multi and member_prefix
+# MUST equal FED_MEMBER_PREFIX, or PropagationPolicies will name clusters
+# that do not exist -- which Karmada matches to nothing, silently.
+experiment:
+  name: active-fl-k8s
+  output_dir: results
+  seed: 42
+
+# --- FL Training Params ---
+training:
+  fl_rounds: 2
+  num_workers: 2               # parallel PPO workers
+  min_workers: 1               # workers that must succeed for a round to count
+  local_episodes: 3            # episodes each worker trains per round
+  eval_episodes: 5             # CartPole episodes for target-env evaluation probe
+  env_id: CartPole-v1
+
+# --- Orchestration ---
+orchestration:
+  temporal_address: temporal-frontend.active-fed.svc.cluster.local:7233
+  # P3: deployment topology. "single" is today's local one-cluster
+  # behaviour; "multi" propagates workers via Karmada across `members`
+  # member clusters (see infra.env.multi, RoundSpec.worker_spec in
+  # src/orchestration/types.py). Threaded through run_pipeline.py into the
+  # pipeline's own topology/members parameters -- these two values must stay
+  # in sync with run_pipeline.py's DEFAULT_TOPOLOGY/DEFAULT_MEMBERS and
+  # active_fl_pipeline's dsl parameter defaults (see
+  # test_topology_and_members_default_layers_agree).
+  topology: multi
+  members: 2
+  # Name prefix of the Karmada member clusters, used to build each
+  # worker's target cluster name. Must equal FED_MEMBER_PREFIX in
+  # infra.env.multi -- fed-infra creates the clusters from that
+  # variable, and a mismatch makes the PropagationPolicy name a
+  # cluster that does not exist, which Karmada matches silently to
+  # nothing rather than reporting an error.
+  member_prefix: active-fed-member
+
+# --- Aggregation Params ---
+aggregation:
+  score_threshold: 0.0         # min improvement to accept a client weight
+  score_temperature: 1.0       # softmax temperature for active weight
+  active_data_threshold: 0.0   # min improvement to include trajectory in active data
+  active_data_steps: 1         # BC fine-tuning epochs per round
+  active_data_lr: 0.0001
+
+# --- Combinations to Run ---
+# Add or remove entries here to control exactly which experiments run.
+# Use --mode single --weight-mode X --active-data-mode Y for a one-off run.
+#
+# weight_mode choices:
+#   active    — scored softmax FedAvg (importance-weighted)
+#   fedavg    — plain equal-weight FedAvg (vanilla FL baseline)
+#   data_only — skip weight averaging; only Active Data updates the model
+#
+# active_data_mode choices:
+#   none — no trajectory fine-tuning
+#   bc   — behavioral cloning on high-value probe trajectories
+#
+# Nonsensical combos (excluded):
+#   fedavg + bc  (fedavg is a pure baseline, mixing in active data changes what it tests)
+#   data_only + none (nothing would update the model)
+combinations:
+  - weight_mode: active
+    active_data_mode: none
+
+# --- Visualization ---
+visualization:
+  output_dir: results/plots
+  solved_threshold: 195.0      # CartPole "solved" reward
+  show_std: true               # show +/- std band on learning curves
+  figure_dpi: 150
+  color_palette:               # one color per weight_mode
+    active: "#4C72B0"
+    fedavg: "#DD8452"
+    data_only: "#55A868"

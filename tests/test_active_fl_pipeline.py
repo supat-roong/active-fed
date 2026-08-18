@@ -272,3 +272,33 @@ def test_member_prefix_matches_the_multi_infra_contract():
                 k, v = line.split("=", 1)
                 env[k] = v
     assert env["FED_MEMBER_PREFIX"] == DEFAULT_MEMBER_PREFIX
+
+
+def test_multi_config_agrees_with_the_multi_infra_contract():
+    """config/k8s-multi.yaml and infra.env.multi describe the same clusters.
+
+    infra.env.multi tells fed-infra how many member clusters to create and
+    what to name them; config/k8s-multi.yaml tells the pipeline which ones to
+    address. A mismatch is silent: Karmada accepts a PropagationPolicy naming
+    a cluster that does not exist and simply matches nothing, so the workers
+    never land anywhere and the round stalls until it times out.
+    """
+    with open(_REPO_ROOT / "config" / "k8s-multi.yaml") as f:
+        cfg = yaml.safe_load(f)
+    orch = cfg["orchestration"]
+    assert orch["topology"] == "multi"
+
+    env = {}
+    with open(_REPO_ROOT / "infra.env.multi") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k] = v
+
+    assert orch["members"] == int(env["FED_MEMBER_COUNT"]), (
+        "config/k8s-multi.yaml's members disagrees with infra.env.multi's "
+        "FED_MEMBER_COUNT, so the pipeline would address a different number "
+        "of member clusters than fed-infra creates"
+    )
+    assert orch["member_prefix"] == env["FED_MEMBER_PREFIX"]
