@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 from kubernetes.client.exceptions import ApiException
 
-from src.orchestration.activities import build_job_manifest, job_name_for
+from src.orchestration.activities import job_name_for
 from src.orchestration.dispatch import (
     KarmadaJobDispatcher,
     LocalJobDispatcher,
@@ -170,9 +170,15 @@ class FakeBatchApi:
     def __init__(self, existing=False):
         self.existing = existing
         self.calls: list[str] = []
+        # p3-task-3-review.md Finding 3: records the body create_namespaced_job
+        # was actually called with, so tests can assert against what the
+        # dispatcher *applied* rather than a second, independent
+        # build_job_manifest(spec) call that proves nothing about it.
+        self.applied_body: dict | None = None
 
     def create_namespaced_job(self, namespace, body):
         self.calls.append("create")
+        self.applied_body = body
         if self.existing:
             raise ApiException(status=409)
         self.existing = True
@@ -462,13 +468,22 @@ def test_karmada_dispatcher_delete_job_tolerates_already_gone():
 async def test_karmada_job_manifest_reused_unchanged_from_p1():
     # KarmadaJobDispatcher must apply the *same* Job manifest P1 builds --
     # topology is a dispatch-time concern, not a manifest-shape concern.
+    #
+    # p3-task-3-review.md Finding 3: this test used to assert against a
+    # *fresh*, independent build_job_manifest(spec) call rather than what
+    # _ensure_job_with actually applied, because FakeBatchApi.create_namespaced_
+    # job never recorded its `body` argument -- the reviewer proved it stayed
+    # green even when the dispatcher was monkeypatched to apply a deliberately
+    # broken manifest (backoffLimit=3, restartPolicy="OnFailure", a different
+    # Job name entirely). FakeBatchApi.applied_body now records what was
+    # actually passed to create_namespaced_job, so this asserts against that.
     spec = _spec(topology="multi", member_cluster="active-fed-member1")
     batch = FakeBatchApi()
     custom = FakeCustomObjectsApi()
     await KarmadaJobDispatcher()._ensure_job_with(batch, custom, spec)
-    # The fake doesn't capture the body directly above; assert indirectly via
-    # build_job_manifest's own backoffLimit/restartPolicy invariants, which
-    # this dispatcher must not alter.
-    manifest = build_job_manifest(spec)
-    assert manifest["spec"]["backoffLimit"] == 0
-    assert manifest["spec"]["template"]["spec"]["restartPolicy"] == "Never"
+
+    applied = batch.applied_body
+    assert applied is not None
+    assert applied["metadata"]["name"] == job_name_for(spec)
+    assert applied["spec"]["backoffLimit"] == 0
+    assert applied["spec"]["template"]["spec"]["restartPolicy"] == "Never"
