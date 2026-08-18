@@ -9,6 +9,25 @@ and activity code depend on these types.
 from __future__ import annotations
 
 import dataclasses
+import re
+
+# RFC 1123 label prefix: must start with a lowercase alphanumeric and contain
+# only lowercase alphanumerics/'-' after that. Not the full RFC 1123 label
+# rule (which also forbids ending in '-') because member_prefix is only ever
+# used as a *prefix*: worker_spec() always appends a digit
+# (f"{member_prefix}{worker_id % member_count + 1}"), so the concatenated
+# member_cluster name always ends in a digit regardless of what member_prefix
+# itself ends with. dispatch.py separately re-validates the full concatenated
+# name against the complete RFC 1123 rule before it ever reaches a
+# PropagationPolicy -- this is defense-in-depth one layer earlier, not the
+# only check.
+#
+# Duplicated here (not imported) from dispatch.py's own copy of the same
+# character-class rule: this module must stay import-stdlib-only (Temporal's
+# workflow sandbox restricts what workflow code may import), and dispatch.py
+# imports `kubernetes` at module scope, so it can never be imported from
+# workflow-reachable code. `re` itself is stdlib, so it's safe here.
+_VALID_MEMBER_PREFIX = re.compile(r"[a-z0-9][-a-z0-9]*")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -111,6 +130,22 @@ class RoundSpec:
         clusters, not none). Catching it here too means a bad multi spec
         can never even produce a WorkerSpec with an unsafe member_cluster,
         regardless of which entry point a future caller uses.
+
+        p3-task-3-review.md Finding 2: a bare `if not self.member_prefix:`
+        used Python truthiness, so a whitespace-only prefix ("   ", "\\t\\n")
+        sailed straight through -- non-empty strings are truthy regardless of
+        content. That doesn't hit the catastrophic empty-clusterNames case
+        (a whitespace-garbage member_cluster selects zero real clusters, not
+        all), but it silently produces a Job that Karmada schedules nowhere,
+        stalling the round with the root cause nowhere near the error.
+        Rejecting outright (not stripping-and-accepting) is the deliberate
+        choice: silently trimming a value that had leading/trailing
+        whitespace would just as silently paper over whatever upstream bug
+        produced it, instead of surfacing it here where the offending value
+        can be quoted directly. The same regex also catches non-blank-but-
+        still-invalid prefixes (uppercase, embedded spaces, a leading '-')
+        that a bare `.strip()` truthiness check would still let through --
+        exactly the "adjacent case" gap the review asked about.
         """
         if self.member_count <= 0:
             raise ValueError(
@@ -118,11 +153,13 @@ class RoundSpec:
                 f"cluster to worker {worker_id} (round {self.fl_round}); got "
                 f"member_count={self.member_count!r}"
             )
-        if not self.member_prefix:
+        if not self.member_prefix or not _VALID_MEMBER_PREFIX.fullmatch(self.member_prefix):
             raise ValueError(
-                f"topology='multi' requires a non-empty member_prefix to assign "
-                f"a member cluster to worker {worker_id} (round {self.fl_round}); "
-                f"got member_prefix={self.member_prefix!r}"
+                f"topology='multi' requires member_prefix to be a non-empty, "
+                f"RFC-1123-style name fragment (lowercase alphanumerics and '-', "
+                f"starting with a lowercase alphanumeric) to assign a member "
+                f"cluster to worker {worker_id} (round {self.fl_round}); got "
+                f"member_prefix={self.member_prefix!r}"
             )
         return f"{self.member_prefix}{worker_id % self.member_count + 1}"
 

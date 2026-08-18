@@ -93,6 +93,43 @@ def test_build_propagation_policy_raises_on_empty_member_cluster():
         build_propagation_policy(spec)
 
 
+# --- p3-task-3-review.md Finding 2: whitespace/format defeats truthiness ----
+# `if not spec.member_cluster:` is Python truthiness -- "   "/"\t\n" are
+# non-empty strings and sail straight through. This doesn't reach the
+# catastrophic empty-clusterNames case (a garbage, non-matching name selects
+# *zero* real clusters, not all), but it silently produces a Job Karmada
+# schedules nowhere, stalling the round with the root cause nowhere near the
+# error. The fix validates the full RFC 1123 label format, not just
+# blankness, so it also catches the adjacent non-blank-but-still-invalid
+# cases (uppercase, embedded spaces) a bare `.strip()` truthiness check
+# would still miss.
+
+@pytest.mark.parametrize("garbage", ["   ", "\t\n", " "])
+def test_build_propagation_policy_raises_on_whitespace_only_member_cluster(garbage):
+    spec = _spec(member_cluster=garbage)
+    with pytest.raises(ValueError):
+        build_propagation_policy(spec)
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    ["ACTIVE-FED-MEMBER1", "active fed member1", "-active-fed-member1", "active-fed-member1-"],
+)
+def test_build_propagation_policy_raises_on_non_blank_but_invalid_member_cluster(garbage):
+    # Non-blank but not a valid RFC 1123 label: uppercase, an embedded space,
+    # or a leading/trailing '-'. Each of these selects zero real clusters
+    # exactly like whitespace does, so each gets the same treatment.
+    spec = _spec(member_cluster=garbage)
+    with pytest.raises(ValueError):
+        build_propagation_policy(spec)
+
+
+def test_dispatcher_for_multi_topology_with_whitespace_only_member_cluster_raises():
+    spec = _spec(topology="multi", member_cluster="\t\n")
+    with pytest.raises(ValueError):
+        dispatcher_for(spec)
+
+
 # ---------------------------------------------------------------------------
 # dispatcher_for
 # ---------------------------------------------------------------------------

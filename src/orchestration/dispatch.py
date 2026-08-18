@@ -13,12 +13,53 @@ lazily inside a function, following the same discipline as
 from __future__ import annotations
 
 import logging
+import re
 from typing import Protocol
 
 from src.orchestration.activities import build_job_manifest, job_name_for
 from src.orchestration.types import WorkerSpec
 
 log = logging.getLogger(__name__)
+
+# RFC 1123 label: lowercase alphanumerics and '-', not starting/ending with
+# '-'. Kubernetes/Karmada cluster names must satisfy this -- matches
+# job_name_for's own validation discipline (activities.py's
+# _VALID_RUN_ID_FRAGMENT) applied to the other name this module builds.
+_VALID_CLUSTER_NAME = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?")
+
+
+def _require_valid_cluster_name(member_cluster: str, context: str) -> None:
+    """Raise ValueError unless member_cluster is a non-blank, RFC-1123-valid
+    Kubernetes/Karmada cluster name.
+
+    p3-task-3-review.md Finding 2: both call sites below used to check only
+    `if not spec.member_cluster:`, Python truthiness -- so "   " / "\t\n"
+    sailed through (a non-empty whitespace string is truthy). That doesn't
+    reach the catastrophic empty-`clusterNames` case (an empty string still
+    raises; a whitespace-garbage name is merely non-empty), but a
+    PropagationPolicy with a `clusterNames` entry that matches no real
+    joined member is accepted by the Karmada apiserver and silently selects
+    *zero* clusters -- the Job schedules nowhere, and the round stalls for
+    the full watch timeout with nothing pointing at a blank/garbage config
+    value as the cause.
+
+    Rejects outright rather than stripping-and-accepting: a caller that
+    silently trims a value with leading/trailing whitespace would just as
+    silently launder whatever upstream bug produced it (a stray newline from
+    a shell substitution, a YAML block scalar, ...) instead of surfacing it
+    here, next to the offending value. Checking the full RFC 1123 label
+    format -- not just blankness -- also catches the same class of
+    non-blank-but-still-broken input a bare `.strip()` truthiness check
+    would still miss (uppercase, embedded spaces, a leading/trailing '-'):
+    any of these selects zero clusters exactly like whitespace does, so they
+    get the same treatment.
+    """
+    if not member_cluster or not _VALID_CLUSTER_NAME.fullmatch(member_cluster):
+        raise ValueError(
+            f"{context} requires member_cluster to be a valid Kubernetes/Karmada "
+            f"cluster name (RFC 1123 label: lowercase alphanumerics and '-', not "
+            f"starting/ending with '-'); got {member_cluster!r}"
+        )
 
 
 class JobDispatcher(Protocol):
@@ -57,13 +98,10 @@ def build_propagation_policy(spec: WorkerSpec) -> dict:
     times the intended work on the wrong physics seeds. Raise instead of
     defaulting clusterNames to empty.
     """
-    if not spec.member_cluster:
-        raise ValueError(
-            f"build_propagation_policy requires a non-empty member_cluster "
-            f"(worker {spec.worker_id}, round {spec.fl_round}); an empty "
-            f"clusterNames list in a Karmada PropagationPolicy targets ALL "
-            f"clusters, not none -- refusing to build one"
-        )
+    _require_valid_cluster_name(
+        spec.member_cluster,
+        f"build_propagation_policy (worker {spec.worker_id}, round {spec.fl_round})",
+    )
 
     return {
         "apiVersion": "policy.karmada.io/v1alpha1",
@@ -102,13 +140,10 @@ def dispatcher_for(spec: WorkerSpec) -> JobDispatcher:
     if spec.topology == "single":
         return LocalJobDispatcher()
     if spec.topology == "multi":
-        if not spec.member_cluster:
-            raise ValueError(
-                f"topology='multi' requires a non-empty member_cluster "
-                f"(worker {spec.worker_id}, round {spec.fl_round}); an empty "
-                f"member_cluster would propagate this worker's Job to every "
-                f"joined member cluster instead of exactly one"
-            )
+        _require_valid_cluster_name(
+            spec.member_cluster,
+            f"topology='multi' (worker {spec.worker_id}, round {spec.fl_round})",
+        )
         return KarmadaJobDispatcher()
     raise ValueError(f"unknown topology {spec.topology!r}; expected 'single' or 'multi'")
 

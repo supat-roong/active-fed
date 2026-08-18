@@ -140,6 +140,41 @@ def test_multi_topology_with_negative_member_count_raises():
         spec.worker_spec(0)
 
 
+# --- p3-task-3-review.md Finding 2: whitespace/format defeats truthiness ----
+# `if not self.member_prefix:` is Python truthiness -- "   "/"\t\n" are
+# non-empty strings and sail straight through, producing a member_cluster
+# like "   1" that selects zero real Karmada clusters (see dispatch.py's
+# build_propagation_policy) instead of raising here, one layer earlier. The
+# fix validates the full character-class format, not just blankness, so it
+# also catches non-blank-but-still-invalid prefixes a bare `.strip()`
+# truthiness check would still miss.
+
+@pytest.mark.parametrize("garbage", ["   ", "\t\n", " "])
+def test_multi_topology_with_whitespace_only_member_prefix_raises(garbage):
+    spec = _round_spec(topology="multi", member_count=2, member_prefix=garbage)
+    with pytest.raises(ValueError):
+        spec.worker_spec(0)
+
+
+@pytest.mark.parametrize("garbage", ["ACTIVE-FED-MEMBER", "active fed member", "-active-member"])
+def test_multi_topology_with_non_blank_but_invalid_member_prefix_raises(garbage):
+    # Non-blank but not RFC-1123-style: uppercase, an embedded space, or a
+    # leading '-'. Each would still produce a member_cluster name selecting
+    # zero real clusters, exactly like whitespace does.
+    spec = _round_spec(topology="multi", member_count=2, member_prefix=garbage)
+    with pytest.raises(ValueError):
+        spec.worker_spec(0)
+
+
+def test_multi_topology_with_trailing_hyphen_member_prefix_is_accepted():
+    # A trailing '-' in member_prefix is fine (unlike a full RFC 1123 label,
+    # which must end alphanumeric): worker_spec() always appends a digit, so
+    # the concatenated member_cluster name always ends alphanumeric
+    # regardless of what member_prefix itself ends with.
+    spec = _round_spec(topology="multi", member_count=2, member_prefix="active-fed-member-")
+    assert spec.worker_spec(0).member_cluster == "active-fed-member-1"
+
+
 def test_report_partitions_succeeded_and_failed():
     report = RoundReport(
         fl_round=0,
