@@ -30,6 +30,13 @@ orchestration:
   # test_topology_and_members_default_layers_agree).
   topology: single
   members: 0
+  # Name prefix of the Karmada member clusters, used to build each
+  # worker's target cluster name. Must equal FED_MEMBER_PREFIX in
+  # infra.env.multi -- fed-infra creates the clusters from that
+  # variable, and a mismatch makes the PropagationPolicy name a
+  # cluster that does not exist, which Karmada matches silently to
+  # nothing rather than reporting an error.
+  member_prefix: active-fed-member
 
 # --- Aggregation Params ---
 aggregation:

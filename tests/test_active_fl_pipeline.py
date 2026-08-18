@@ -226,3 +226,49 @@ def test_topology_and_members_default_layers_agree(tmp_path):
         "active_fl_pipeline's members default disagrees with run_pipeline.py's "
         "DEFAULT_MEMBERS -- exactly the layer-disagreement Finding 1 warned about"
     )
+
+
+def test_member_prefix_is_threaded_from_config_not_hardcoded(tmp_path):
+    """member_prefix must agree across all three layers, like topology/members.
+
+    The pipeline builds each worker's target cluster as
+    f"{member_prefix}{worker_id % members + 1}", and that name has to match
+    the kind clusters fed-infra actually creates from FED_MEMBER_PREFIX in
+    infra.env.multi. If member_prefix is a hardcoded dsl default with no
+    config source, changing FED_MEMBER_PREFIX alone silently desynchronises
+    the two: the PropagationPolicy names a cluster that does not exist,
+    Karmada matches nothing, the Job never lands anywhere, and the round
+    hangs until the activity times out rather than failing.
+    """
+    from src.pipelines.run_pipeline import DEFAULT_MEMBER_PREFIX
+
+    with open(_REPO_ROOT / "config" / "k8s.yaml") as f:
+        cfg = yaml.safe_load(f)
+    orch = cfg.get("orchestration", {})
+    assert "member_prefix" in orch, (
+        "config/k8s.yaml has no orchestration.member_prefix, so the value is "
+        "unreachable from the config layer that infra.env.multi is tuned against"
+    )
+    assert orch["member_prefix"] == DEFAULT_MEMBER_PREFIX
+
+    spec = yaml.safe_load(_compile(tmp_path))
+    params = spec["root"]["inputDefinitions"]["parameters"]
+    assert params["member_prefix"]["defaultValue"] == DEFAULT_MEMBER_PREFIX
+
+
+def test_member_prefix_matches_the_multi_infra_contract():
+    """The pipeline default and FED_MEMBER_PREFIX in infra.env.multi must match.
+
+    These are the two ends of the same coupling: fed-infra names the member
+    kind clusters, the pipeline addresses them.
+    """
+    from src.pipelines.run_pipeline import DEFAULT_MEMBER_PREFIX
+
+    env = {}
+    with open(_REPO_ROOT / "infra.env.multi") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k] = v
+    assert env["FED_MEMBER_PREFIX"] == DEFAULT_MEMBER_PREFIX

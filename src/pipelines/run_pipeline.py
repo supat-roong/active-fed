@@ -26,6 +26,11 @@ log = logging.getLogger(__name__)
 # literals that can drift apart unnoticed.
 DEFAULT_TOPOLOGY = "single"
 DEFAULT_MEMBERS = 0
+# Must equal FED_MEMBER_PREFIX in infra.env.multi: fed-infra names the
+# member kind clusters from that variable, and the pipeline addresses them
+# by the same name. Enforced by
+# test_member_prefix_matches_the_multi_infra_contract.
+DEFAULT_MEMBER_PREFIX = "active-fed-member"
 
 
 def compute_start_round(minio_client, bucket: str) -> int:
@@ -155,6 +160,7 @@ def main():
     )
     topology = orch.get("topology", DEFAULT_TOPOLOGY)
     members = orch.get("members", DEFAULT_MEMBERS)
+    member_prefix = orch.get("member_prefix", DEFAULT_MEMBER_PREFIX)
     seed = exp.get("seed", 42)
 
     combos = cfg.get("combinations", [{"weight_mode": "active", "active_data_mode": "bc"}])
@@ -275,6 +281,7 @@ def main():
             "temporal_address": temporal_address,
             "topology": topology,
             "members": members,
+            "member_prefix": member_prefix,
             "run_uid": run_uid,
             "seed": seed,
             # P2 review fix wave, Finding 1: start_round is NOT passed here.
