@@ -8,6 +8,7 @@ from src.orchestration.activities import (
     _ensure_job,
     build_job_manifest,
     classify_job_status,
+    cleanup_worker_job,
     job_name_for,
     launch_and_watch_pod,
 )
@@ -390,3 +391,134 @@ async def test_launch_and_watch_pod_returns_normally_on_success(monkeypatch):
     assert result.worker_id == 2
     assert result.failure_reason == ""
     assert result.attempts == 1
+
+
+# ---------------------------------------------------------------------------
+# P3 Task 4: topology='multi' wiring. launch_and_watch_pod must dispatch via
+# dispatcher_for(spec) and wait on the MinIO completion artifact instead of
+# watching the pod directly; cleanup_worker_job must route through the same
+# dispatcher so a member-cluster worker's PropagationPolicy gets cleaned up
+# too. topology='single' specs (all tests above) must still take the exact
+# P1 code path -- the _forbid_k8s_batch_and_core guard below is a deliberate
+# regression check that the multi branch never touches the local-cluster
+# client, and doubles as a safety net against ever reaching a real
+# kubeconfig if the branch selection regresses.
+# ---------------------------------------------------------------------------
+
+
+def _multi_spec(**overrides) -> WorkerSpec:
+    return _spec(topology="multi", member_cluster="active-fed-member1", **overrides)
+
+
+class FakeDispatcher:
+    def __init__(self):
+        self.ensure_calls: list[int] = []
+        self.delete_calls: list[int] = []
+
+    def ensure_job(self, spec):
+        self.ensure_calls.append(spec.worker_id)
+        return f"fake-job-w{spec.worker_id}"
+
+    def delete_job(self, spec):
+        self.delete_calls.append(spec.worker_id)
+
+
+class FakeMinioClientForActivities:
+    """Presence-scripted stand-in for the multi-topology minio client seam."""
+
+    def __init__(self, present: bool):
+        self.present = present
+        self.calls = 0
+
+    def stat_object(self, bucket, key):
+        from minio.error import S3Error
+
+        self.calls += 1
+        if self.present:
+            return SimpleNamespace(object_name=key)
+        raise S3Error(
+            response=None, code="NoSuchKey", message="nope", resource=f"/{bucket}/{key}",
+            request_id="r", host_id="h",
+        )
+
+
+def _forbid_k8s_batch_and_core(monkeypatch):
+    """topology='multi' must never touch _k8s_batch_and_core -- that seam is
+    the local-cluster client; dispatching to a member cluster goes through
+    dispatcher_for/Karmada instead."""
+    import src.orchestration.activities as activities_module
+
+    def _boom():
+        raise AssertionError("_k8s_batch_and_core must not be called for topology='multi'")
+
+    monkeypatch.setattr(activities_module, "_k8s_batch_and_core", _boom)
+
+
+async def test_launch_and_watch_pod_multi_topology_dispatches_and_waits_for_artifact(monkeypatch):
+    import src.orchestration.activities as activities_module
+    import src.orchestration.dispatch as dispatch_module
+
+    _forbid_k8s_batch_and_core(monkeypatch)
+    fake_dispatcher = FakeDispatcher()
+    monkeypatch.setattr(dispatch_module, "dispatcher_for", lambda spec: fake_dispatcher)
+    fake_minio = FakeMinioClientForActivities(present=True)
+    monkeypatch.setattr(activities_module, "_minio_client_for", lambda spec: fake_minio)
+
+    result = await launch_and_watch_pod(_multi_spec())
+
+    assert result.succeeded is True
+    assert result.job_name == "fake-job-w2"
+    assert result.failure_reason == ""
+    assert fake_dispatcher.ensure_calls == [2]
+    assert fake_minio.calls == 1
+
+
+async def test_launch_and_watch_pod_multi_topology_raises_not_returns_on_missing_artifact(
+    monkeypatch,
+):
+    # THE constraint of this task: a multi-cluster worker whose completion
+    # artifact never appears must raise -- not return
+    # WorkerResult(succeeded=False, ...) -- or Temporal's
+    # RetryPolicy(maximum_attempts=3) silently becomes a single attempt,
+    # exactly the bug WorkerJobFailed already exists to prevent for the
+    # single-topology Job-watch path above.
+    import src.orchestration.activities as activities_module
+    import src.orchestration.dispatch as dispatch_module
+    from src.orchestration.activities import WorkerJobFailed
+
+    _forbid_k8s_batch_and_core(monkeypatch)
+    monkeypatch.setattr(activities_module, "POD_WATCH_TIMEOUT_S", 0.03)
+    monkeypatch.setattr(activities_module, "POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(activities_module.activity, "heartbeat", lambda *a, **k: None)
+
+    fake_dispatcher = FakeDispatcher()
+    monkeypatch.setattr(dispatch_module, "dispatcher_for", lambda spec: fake_dispatcher)
+    monkeypatch.setattr(
+        activities_module, "_minio_client_for",
+        lambda spec: FakeMinioClientForActivities(present=False),
+    )
+    # Karmada diagnostics are best-effort enrichment only -- make the lookup
+    # itself blow up too, and confirm that still doesn't mask the real
+    # failure (it must never turn this into a reported success).
+    monkeypatch.setattr(
+        dispatch_module, "_karmada_clients",
+        lambda: (_ for _ in ()).throw(RuntimeError("karmada apiserver unreachable")),
+    )
+
+    with pytest.raises(WorkerJobFailed) as exc_info:
+        await launch_and_watch_pod(_multi_spec())
+
+    assert "active-fed-member1" in str(exc_info.value)
+    assert fake_dispatcher.ensure_calls == [2]
+
+
+async def test_cleanup_worker_job_multi_topology_deletes_via_dispatcher(monkeypatch):
+    import src.orchestration.dispatch as dispatch_module
+
+    _forbid_k8s_batch_and_core(monkeypatch)
+    fake_dispatcher = FakeDispatcher()
+    monkeypatch.setattr(dispatch_module, "dispatcher_for", lambda spec: fake_dispatcher)
+
+    await cleanup_worker_job(_multi_spec())
+
+    assert fake_dispatcher.delete_calls == [2]

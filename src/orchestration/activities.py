@@ -293,13 +293,97 @@ class WorkerJobFailed(Exception):
     """
 
 
+async def wait_for_worker_artifact(
+    minio_client,
+    bucket: str,
+    fl_round: int,
+    worker_id: int,
+    timeout_s: float,
+    poll_s: float,
+) -> bool:
+    """Poll MinIO for the one object that means a multi-cluster worker is done.
+
+    The host cannot reliably watch a pod Karmada has propagated to a member
+    cluster (see dispatch.py), but train_worker.py's _push_weights already
+    uploads, per worker per round, in this order:
+      1. round_{fl_round}/workers/worker_{worker_id}_weights.pt
+      2. round_{fl_round}/workers/worker_{worker_id}_delta.pt
+      3. round_{fl_round}/workers/worker_{worker_id}_metrics.json
+    and the aggregator (collect.py) already treats the metrics object's
+    presence as "this worker succeeded". Only the metrics key is checked
+    here -- weights and delta land *first*, so a check that stopped at
+    worker_{worker_id}_weights.pt would read a partial, still-in-flight
+    upload as a finished worker.
+
+    Heartbeats every failed poll (matching launch_and_watch_pod's
+    single-topology loop below) so Temporal can distinguish a slow
+    member-cluster worker from a wedged one.
+
+    Raises TimeoutError instead of returning False when the artifact never
+    appears within timeout_s. This matters exactly as much as
+    WorkerJobFailed does for the single-topology path above: Temporal's
+    RetryPolicy(maximum_attempts=3) only ever fires for a *raised*
+    exception, so returning False here would silently turn 3 retry attempts
+    into 1 for every multi-cluster worker whose artifact never lands.
+    """
+    from minio.error import S3Error
+
+    key = f"round_{fl_round}/workers/worker_{worker_id}_metrics.json"
+    waited = 0.0
+    while waited < timeout_s:
+        try:
+            minio_client.stat_object(bucket, key)
+            return True
+        except S3Error as e:
+            if e.code not in ("NoSuchKey", "NoSuchObject"):
+                log.warning(f"transient MinIO error polling for {key}: {e}")
+            # else: simply not uploaded yet -- keep polling.
+
+        activity.heartbeat(
+            {"worker_id": worker_id, "fl_round": fl_round, "waited_s": waited, "artifact": key}
+        )
+        await asyncio.sleep(poll_s)
+        waited += poll_s
+
+    raise TimeoutError(
+        f"worker {worker_id} round {fl_round}: {key} did not appear in MinIO "
+        f"within {timeout_s}s"
+    )
+
+
+def _minio_client_for(spec: WorkerSpec):
+    """Lazily build a MinIO client from a WorkerSpec's credentials.
+
+    Kept out of module scope (like _k8s_batch_and_core below) so the pure
+    functions in this module stay importable without the minio package's
+    transitive dependencies configured.
+    """
+    from minio import Minio
+
+    return Minio(
+        endpoint=spec.minio_endpoint,
+        access_key=spec.minio_access_key,
+        secret_key=spec.minio_secret_key,
+        secure=False,
+    )
+
+
 @activity.defn
 async def launch_and_watch_pod(spec: WorkerSpec) -> WorkerResult:
     """Create the worker Job if absent, then watch it to completion.
 
-    Heartbeats every poll so Temporal can distinguish a slow worker from a
-    wedged one — this is what replaces the old fixed 20-minute ceiling.
+    topology='single' (unchanged from P1, below): watches the Job directly
+    via the local Kubernetes API, heartbeating every poll so Temporal can
+    distinguish a slow worker from a wedged one.
+
+    topology='multi': the pod runs on a Karmada member cluster the host
+    cannot reliably watch (see dispatch.py), so this dispatches the Job via
+    dispatcher_for(spec) and waits on its MinIO completion artifact instead
+    -- see wait_for_worker_artifact and _launch_and_watch_pod_multi.
     """
+    if spec.topology == "multi":
+        return await _launch_and_watch_pod_multi(spec)
+
     from kubernetes.client.exceptions import ApiException
 
     batch, core = _k8s_batch_and_core()
@@ -348,6 +432,74 @@ async def launch_and_watch_pod(spec: WorkerSpec) -> WorkerResult:
         worker_id=spec.worker_id, succeeded=False, attempts=0,
         failure_reason=f"timed out after {POD_WATCH_TIMEOUT_S}s", job_name=name,
     )
+
+
+async def _launch_and_watch_pod_multi(spec: WorkerSpec) -> WorkerResult:
+    """topology='multi': dispatch to spec.member_cluster via Karmada, then
+    wait on the MinIO completion artifact rather than watching the pod --
+    the host cannot reliably watch a pod on a member cluster (dispatch.py).
+
+    The Karmada aggregated API is consulted only as best-effort failure
+    enrichment, inside a try/except that can never turn a real failure into
+    a reported success -- matching _failure_reason/_log_tail's contract
+    above for the single-topology path. Whatever wait_for_worker_artifact
+    raises (timeout or otherwise) is what drives the outcome; the Karmada
+    lookup only adds context to the message.
+    """
+    from src.orchestration.dispatch import dispatcher_for
+
+    dispatcher = dispatcher_for(spec)
+    name = dispatcher.ensure_job(spec)
+    minio_client = _minio_client_for(spec)
+
+    try:
+        await wait_for_worker_artifact(
+            minio_client,
+            spec.minio_bucket,
+            spec.fl_round,
+            spec.worker_id,
+            timeout_s=POD_WATCH_TIMEOUT_S,
+            poll_s=POLL_INTERVAL_S,
+        )
+    except Exception as e:
+        reason = await _karmada_failure_reason(spec, name)
+        message = (
+            f"worker {spec.worker_id} job {name} on member cluster "
+            f"{spec.member_cluster!r} produced no completion artifact: {e}"
+        )
+        if reason:
+            message += f"\n--- Karmada aggregated Job status ---\n{reason}"
+        raise WorkerJobFailed(message) from e
+
+    return WorkerResult(
+        worker_id=spec.worker_id, succeeded=True, attempts=1, failure_reason="", job_name=name,
+    )
+
+
+async def _karmada_failure_reason(spec: WorkerSpec, job_name: str) -> str:
+    """Best-effort diagnostics from the Karmada aggregated API for a failed
+    multi-cluster worker.
+
+    Consulted only after wait_for_worker_artifact has already given up, and
+    only to enrich the raised message -- never able to turn a real failure
+    into a reported success. Any failure here (aggregated API unreachable,
+    FED_KARMADA_CONFIG unset, member cluster unreachable, ...) is swallowed
+    and surfaces as a plain diagnostic string, exactly like
+    _failure_reason/_log_tail's contract for the single-topology path.
+    """
+    try:
+        from src.orchestration.dispatch import _karmada_clients
+
+        batch, _ = _karmada_clients()
+        job = batch.read_namespaced_job_status(name=job_name, namespace=spec.namespace)
+        status = job.status
+        conditions = ", ".join(f"{c.type}={c.status}" for c in (status.conditions or []))
+        return (
+            f"active={status.active or 0} succeeded={status.succeeded or 0} "
+            f"failed={status.failed or 0} conditions=[{conditions}]"
+        )
+    except Exception as e:
+        return f"unavailable: {e}"
 
 
 async def _attempt_count(core, spec: WorkerSpec, job_name: str) -> int:
@@ -428,7 +580,26 @@ async def _log_tail(
 
 @activity.defn
 async def cleanup_worker_job(spec: WorkerSpec) -> None:
-    """Delete the Job and its pods. Safe to call when already gone."""
+    """Delete the Job and its pods. Safe to call when already gone.
+
+    topology='multi' delegates to dispatcher_for(spec) (KarmadaJobDispatcher),
+    which also deletes the PropagationPolicy that pinned the Job to
+    spec.member_cluster -- leaving that behind would leak one Karmada object
+    per finished worker. topology='single' is unchanged from P1: it keeps
+    calling _k8s_batch_and_core() directly rather than routing through
+    LocalJobDispatcher, which duplicates the same lazy client builder under a
+    distinct module-level name in dispatch.py -- existing tests monkeypatch
+    *this* module's _k8s_batch_and_core specifically, and routing through
+    dispatch's own copy would silently bypass that seam (and, in production,
+    would be equally correct but pointlessly indirect for a case that never
+    needs Karmada at all).
+    """
+    if spec.topology == "multi":
+        from src.orchestration.dispatch import dispatcher_for
+
+        dispatcher_for(spec).delete_job(spec)
+        return
+
     from kubernetes.client.exceptions import ApiException
 
     batch, _ = _k8s_batch_and_core()
