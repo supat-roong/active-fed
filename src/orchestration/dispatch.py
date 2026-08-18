@@ -16,7 +16,14 @@ import logging
 import re
 from typing import Protocol
 
-from src.orchestration.activities import build_job_manifest, job_name_for
+from src.orchestration.activities import (
+    JOB_DELETE_POLL_S,
+    JOB_DELETE_TIMEOUT_S,
+    _await_job_deleted,
+    _karmada_job_status,
+    build_job_manifest,
+    job_name_for,
+)
 from src.orchestration.types import WorkerSpec
 
 log = logging.getLogger(__name__)
@@ -63,7 +70,7 @@ def _require_valid_cluster_name(member_cluster: str, context: str) -> None:
 
 
 class JobDispatcher(Protocol):
-    def ensure_job(self, spec: WorkerSpec) -> str:
+    async def ensure_job(self, spec: WorkerSpec) -> str:
         """Create the worker Job if absent. Idempotent. Returns the Job name."""
         ...
 
@@ -151,7 +158,12 @@ def dispatcher_for(spec: WorkerSpec) -> JobDispatcher:
 class LocalJobDispatcher:
     """Today's (P1) behaviour: create/delete a batch/v1 Job in the local cluster."""
 
-    def ensure_job(self, spec: WorkerSpec) -> str:
+    async def ensure_job(self, spec: WorkerSpec) -> str:
+        # async only to satisfy JobDispatcher's Protocol (KarmadaJobDispatcher
+        # needs to await a delete-and-recreate poll on 409; this path never
+        # does -- topology="single" doesn't route through this class at all
+        # today, launch_and_watch_pod calls activities._ensure_job directly,
+        # which already has its own delete-and-recreate handling).
         batch, _ = _k8s_batch_and_core()
         return self._ensure_job_with(batch, spec)
 
@@ -191,15 +203,64 @@ class KarmadaJobDispatcher:
     cluster -- topology is a dispatch-time concern, not a manifest-shape one.
     """
 
-    def ensure_job(self, spec: WorkerSpec) -> str:
+    async def ensure_job(self, spec: WorkerSpec) -> str:
         batch, custom = _karmada_clients()
-        return self._ensure_job_with(batch, custom, spec)
+        return await self._ensure_job_with(batch, custom, spec)
 
     def delete_job(self, spec: WorkerSpec) -> None:
         batch, custom = _karmada_clients()
         self._delete_job_with(batch, custom, spec)
 
-    def _ensure_job_with(self, batch, custom, spec: WorkerSpec) -> str:
+    async def _ensure_job_with(self, batch, custom, spec: WorkerSpec) -> str:
+        """Create the worker Job (and its PropagationPolicy) if absent,
+        repairing a terminally-failed Job left over from a previous attempt
+        instead of blindly re-attaching to it.
+
+        p3-task-4-review.md Finding 1: Job names are deterministic
+        (job_name_for), so a Temporal *activity* retry of a failed worker
+        hits create_namespaced_job for a name that already exists on the
+        Karmada control plane (409) -- exactly what a previous, real failure
+        left behind. Re-attaching unconditionally (the pre-fix behaviour)
+        meant the retry polled MinIO for an artifact a dead Job can never
+        produce, burning the full POD_WATCH_TIMEOUT_S on every one of
+        Temporal's retry attempts for nothing. This mirrors
+        activities._ensure_job, the single-topology fix for the identical
+        bug (F5): on 409, classify the existing Job and only delete+recreate
+        it if it's terminally failed; otherwise leave it alone.
+
+        The one thing single-topology doesn't need and this does: Job status
+        for a *propagated* Job lives on the Karmada aggregated API, not a
+        local read, so this reuses activities._karmada_job_status (the same
+        helper _karmada_failure_reason/_karmada_terminal_failure already
+        share) rather than a second status-reading path. Its contract is
+        exactly what makes this safe: an absent or lagging aggregated status
+        -- Karmada hasn't propagated/observed the Job on the member cluster
+        yet, completely normal for the first few seconds after dispatch, and
+        also what an unreachable Karmada apiserver or unset
+        FED_KARMADA_CONFIG looks like -- returns outcome=None, treated
+        exactly like "still running", never as failure. Only a definite
+        Failed condition triggers delete-and-recreate. Getting this backwards
+        -- deleting a healthy, just-propagated Job because its aggregated
+        status hasn't shown up yet -- would be a worse bug than the one this
+        fixes: it would kill a live worker instead of merely wasting time on
+        a dead one.
+
+        Deleting a propagated Job means deleting it on the Karmada control
+        plane (batch here is the Karmada BatchV1Api, from _karmada_clients),
+        the same client this method already creates/reads through -- exactly
+        like _delete_job_with's teardown path, `propagation_policy=
+        "Background"` cascades the delete down to the member cluster's copy.
+        _await_job_deleted (shared with the single-topology path, imported
+        rather than reimplemented) blocks until the delete is confirmed gone
+        before recreating, so the recreate can't race a half-deleted object.
+
+        The PropagationPolicy is deliberately left untouched by the delete/
+        recreate branch: build_propagation_policy selects the Job by its
+        deterministic name, not by UID or generation, so the
+        already-existing policy (still 409s, below, unchanged either way)
+        keeps selecting -- and Karmada keeps re-propagating -- whichever Job
+        currently has that name, including the one just recreated here.
+        """
         from kubernetes.client.exceptions import ApiException
 
         manifest = build_job_manifest(spec)
@@ -209,6 +270,23 @@ class KarmadaJobDispatcher:
         except ApiException as e:
             if e.status != 409:
                 raise
+
+            outcome, message = await _karmada_job_status(spec, name)
+            if outcome == "failed":
+                log.info(
+                    f"Job {name} exists on Karmada but is terminally failed "
+                    f"({message}); deleting and recreating"
+                )
+                batch.delete_namespaced_job(
+                    name=name, namespace=spec.namespace, propagation_policy="Background"
+                )
+                await _await_job_deleted(
+                    batch, spec.namespace, name,
+                    timeout_s=JOB_DELETE_TIMEOUT_S, poll_s=JOB_DELETE_POLL_S,
+                )
+                batch.create_namespaced_job(namespace=spec.namespace, body=manifest)
+            else:
+                log.info(f"Job {name} already exists on Karmada ({message}); re-attaching")
 
         policy = build_propagation_policy(spec)
         group, version = policy["apiVersion"].split("/")
@@ -249,10 +327,12 @@ def _k8s_batch_and_core():
     """Lazily build a BatchV1Api/CoreV1Api pointed at the local cluster.
 
     Deliberately duplicated (not imported) from activities.py: importing
-    activities._k8s_batch_and_core here would be equally correct, but keeping
-    this module's only dependency on activities.py limited to the two pure
-    functions (build_job_manifest, job_name_for) keeps the "who talks to
-    Kubernetes" boundary in one place per topology.
+    activities._k8s_batch_and_core here would be equally correct, but this
+    module's dependencies on activities.py are all either pure functions
+    (build_job_manifest, job_name_for) or Karmada-aggregated-API helpers
+    (_karmada_job_status, _await_job_deleted, the JOB_DELETE_* constants) --
+    never the *local*-cluster client, which keeps the "who talks to which
+    cluster" boundary in one place per topology.
     """
     from kubernetes import client
     from kubernetes import config as k8s_config

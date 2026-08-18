@@ -1,4 +1,5 @@
 import re
+from types import SimpleNamespace
 
 import pytest
 from kubernetes.client.exceptions import ApiException
@@ -182,6 +183,19 @@ class FakeBatchApi:
             raise ApiException(status=404)
         self.existing = False
 
+    def read_namespaced_job_status(self, name, namespace):
+        # Only exercised via _await_job_deleted's delete-then-poll loop
+        # (p3-task-4-review.md Finding 1 fix): it needs to see the Job gone
+        # once delete_namespaced_job has run, on the *same* client used to
+        # create/delete it -- the Karmada aggregated *status classification*
+        # goes through a separate client (_karmada_clients, see
+        # FakeKarmadaStatusApi below), so the content returned here is never
+        # inspected, only whether this raises 404.
+        self.calls.append("read")
+        if not self.existing:
+            raise ApiException(status=404)
+        return SimpleNamespace(status=None)
+
 
 def test_local_dispatcher_ensure_job_creates_and_returns_job_name():
     spec = _spec(topology="single", member_cluster="")
@@ -228,11 +242,11 @@ class FakeCustomObjectsApi:
         self.existing = False
 
 
-def test_karmada_dispatcher_ensure_job_applies_job_and_propagation_policy():
+async def test_karmada_dispatcher_ensure_job_applies_job_and_propagation_policy():
     spec = _spec(topology="multi", member_cluster="active-fed-member1")
     batch = FakeBatchApi()
     custom = FakeCustomObjectsApi()
-    name = KarmadaJobDispatcher()._ensure_job_with(batch, custom, spec)
+    name = await KarmadaJobDispatcher()._ensure_job_with(batch, custom, spec)
     assert name == job_name_for(spec)
     assert batch.calls == ["create"]
     assert custom.calls == [
@@ -240,13 +254,191 @@ def test_karmada_dispatcher_ensure_job_applies_job_and_propagation_policy():
     ]
 
 
-def test_karmada_dispatcher_ensure_job_is_idempotent():
+async def test_karmada_dispatcher_ensure_job_is_idempotent(monkeypatch):
+    import src.orchestration.dispatch as dispatch_module
+
     spec = _spec(topology="multi", member_cluster="active-fed-member1")
     batch = FakeBatchApi(existing=True)
     custom = FakeCustomObjectsApi(existing=True)
+    # The aggregated-status lookup (p3-task-4-review.md Finding 1 fix) is a
+    # separate client from `batch` above -- monkeypatch it explicitly here
+    # (rather than relying on FED_KARMADA_CONFIG being unset in this
+    # environment) so this test's "must not raise" guarantee doesn't
+    # silently depend on ambient process state. A still-running status is
+    # the least surprising thing to script for a bare "must not raise"
+    # idempotency check; the absent/lagging and terminally-failed cases each
+    # get their own dedicated test below.
+    running = _job_status(conditions=[])
+    monkeypatch.setattr(
+        dispatch_module, "_karmada_clients", lambda: (FakeKarmadaStatusApi(running), None)
+    )
     # Must not raise even though both the Job and the PropagationPolicy
     # already exist from a previous (e.g. retried) attempt.
-    KarmadaJobDispatcher()._ensure_job_with(batch, custom, spec)
+    await KarmadaJobDispatcher()._ensure_job_with(batch, custom, spec)
+    # ...and, per p3-task-4-review.md Finding 1, must not have deleted the
+    # still-running Job either.
+    assert "delete:Background" not in batch.calls
+
+
+# ---------------------------------------------------------------------------
+# p3-task-4-review.md Finding 1: on a 409 (Job already exists -- exactly what
+# a Temporal *activity retry* of a failed worker sees, since job_name_for is
+# deterministic), the pre-fix KarmadaJobDispatcher just swallowed the 409 and
+# re-attached unconditionally. If the existing Job was terminally Failed
+# (real containers crash), every retry attempt re-polled MinIO for an
+# artifact a dead Job can never produce, burning the full POD_WATCH_TIMEOUT_S
+# per attempt for nothing. FakeKarmadaStatusApi below is a fake for the
+# Karmada *aggregated* BatchV1Api (from _karmada_clients, monkeypatched),
+# stateful enough to script create -> [409] -> read (classify) ->
+# (delete -> poll-until-gone) -> create, mirroring
+# test_orchestration_activities.py's FakeBatchApi/PollingFakeBatchApi for
+# activities._ensure_job, the single-topology fix for the identical bug.
+# ---------------------------------------------------------------------------
+
+
+def _condition(type_: str, status: str) -> SimpleNamespace:
+    return SimpleNamespace(type=type_, status=status)
+
+
+def _job_status(conditions=None, succeeded=None, failed=None, active=None) -> SimpleNamespace:
+    return SimpleNamespace(conditions=conditions, succeeded=succeeded, failed=failed, active=active)
+
+
+class FakeKarmadaStatusApi:
+    """Fake for the Karmada aggregated BatchV1Api returned by
+    _karmada_clients(), used only for the read_namespaced_job_status calls
+    _karmada_job_status makes -- decoupled from FakeBatchApi's create/delete
+    tracking (a real Karmada aggregated-status read goes through a distinct
+    client construction from the Job create/delete calls, so this mirrors
+    that split rather than collapsing it).
+
+    aggregated_status=None means "absent/lagging" -- Karmada hasn't
+    propagated/observed the Job on the member cluster yet, which read_namespaced_
+    job_status models as a 404, exactly like an absent Job. reads_until_deleted
+    lets a test prove the delete-then-poll loop (_await_job_deleted) actually
+    polls instead of assuming instant deletion.
+    """
+
+    def __init__(self, aggregated_status, reads_until_deleted=0):
+        self.aggregated_status = aggregated_status
+        self.reads_until_deleted = reads_until_deleted
+        self.read_calls = 0
+
+    def read_namespaced_job_status(self, name, namespace):
+        self.read_calls += 1
+        if self.aggregated_status is None:
+            raise ApiException(status=404)
+        if self.reads_until_deleted > 0:
+            self.reads_until_deleted -= 1
+        elif self.read_calls > 1:
+            # Once the delete-wait loop has polled once past the countdown,
+            # report gone -- mirrors a real deletion completing.
+            self.aggregated_status = None
+            raise ApiException(status=404)
+        return SimpleNamespace(status=self.aggregated_status)
+
+
+async def test_karmada_dispatcher_ensure_job_reattaches_to_a_still_active_existing_job(
+    monkeypatch,
+):
+    # A retry against a genuinely live Job: 409 on create, aggregated status
+    # is running (no terminal condition) -- must re-attach, never delete.
+    import src.orchestration.dispatch as dispatch_module
+
+    spec = _spec(topology="multi", member_cluster="active-fed-member1")
+    batch = FakeBatchApi(existing=True)
+    custom = FakeCustomObjectsApi(existing=True)
+    running = _job_status(conditions=[])
+    status_api = FakeKarmadaStatusApi(running)
+    monkeypatch.setattr(dispatch_module, "_karmada_clients", lambda: (status_api, None))
+
+    name = await KarmadaJobDispatcher()._ensure_job_with(batch, custom, spec)
+
+    assert name == job_name_for(spec)
+    assert batch.calls == ["create"]  # exactly one create attempt; no delete
+    assert status_api.read_calls == 1  # one status read to classify it
+
+
+async def test_karmada_dispatcher_ensure_job_deletes_and_recreates_a_terminally_failed_job(
+    monkeypatch,
+):
+    # A retry against a terminally-failed Job (a real container crash): 409
+    # on create, aggregated status is Failed -- must delete, wait for the
+    # delete to complete, and recreate. Must not just re-attach.
+    import src.orchestration.dispatch as dispatch_module
+
+    spec = _spec(topology="multi", member_cluster="active-fed-member1")
+    batch = FakeBatchApi(existing=True)
+    custom = FakeCustomObjectsApi(existing=True)
+    failed = _job_status(conditions=[_condition("Failed", "True")])
+    status_api = FakeKarmadaStatusApi(failed, reads_until_deleted=0)
+    monkeypatch.setattr(dispatch_module, "_karmada_clients", lambda: (status_api, None))
+
+    name = await KarmadaJobDispatcher()._ensure_job_with(batch, custom, spec)
+
+    assert name == job_name_for(spec)
+    # create (409) -> delete -> (poll via _await_job_deleted) -> create again.
+    assert batch.calls[0] == "create"
+    assert batch.calls[1] == "delete:Background"
+    assert batch.calls.count("create") == 2
+    assert batch.existing is True  # the recreated Job is left in place
+    # The already-existing PropagationPolicy (still 409s) is left untouched
+    # -- it selects by the Job's deterministic name, so it stays consistent
+    # with whichever Job currently has that name without needing to be
+    # deleted/recreated itself.
+    assert custom.calls == [
+        ("create", "propagationpolicies", build_propagation_policy(spec)["metadata"]["name"])
+    ]
+
+
+async def test_karmada_dispatcher_ensure_job_does_not_delete_on_absent_or_lagging_status(
+    monkeypatch,
+):
+    # THE safety property p3-task-4-review.md Finding 1 warns about most
+    # explicitly: the Karmada aggregated status can be absent or lagging
+    # right after dispatch (the Job hasn't propagated to the member cluster
+    # yet, or the aggregated API hasn't caught up). Absent must mean "not
+    # yet", never "failed" -- deleting a healthy, just-propagated Job because
+    # its status hasn't appeared would be a worse bug than the one this
+    # fixes. A 409 on create (the Job object already exists on the control
+    # plane) combined with a 404 on the aggregated status read (Karmada
+    # hasn't observed/propagated it yet) is exactly that lagging window.
+    import src.orchestration.dispatch as dispatch_module
+
+    spec = _spec(topology="multi", member_cluster="active-fed-member1")
+    batch = FakeBatchApi(existing=True)
+    custom = FakeCustomObjectsApi(existing=True)
+    status_api = FakeKarmadaStatusApi(aggregated_status=None)
+    monkeypatch.setattr(dispatch_module, "_karmada_clients", lambda: (status_api, None))
+
+    name = await KarmadaJobDispatcher()._ensure_job_with(batch, custom, spec)  # must not raise
+
+    assert name == job_name_for(spec)
+    assert "delete:Background" not in batch.calls
+    assert batch.calls.count("create") == 1  # no delete-and-recreate cycle
+
+
+async def test_karmada_dispatcher_ensure_job_does_not_delete_when_karmada_unreachable(
+    monkeypatch,
+):
+    # Same safety property, different cause: the Karmada apiserver itself is
+    # unreachable (or FED_KARMADA_CONFIG unset). Best-effort status lookup
+    # failing must never be misread as "failed" -- MinIO polling (or, here,
+    # simply re-attaching) remains the ground truth.
+    import src.orchestration.dispatch as dispatch_module
+
+    spec = _spec(topology="multi", member_cluster="active-fed-member1")
+    batch = FakeBatchApi(existing=True)
+    custom = FakeCustomObjectsApi(existing=True)
+    monkeypatch.setattr(
+        dispatch_module, "_karmada_clients",
+        lambda: (_ for _ in ()).throw(RuntimeError("karmada apiserver unreachable")),
+    )
+
+    await KarmadaJobDispatcher()._ensure_job_with(batch, custom, spec)  # must not raise
+
+    assert "delete:Background" not in batch.calls
+    assert batch.calls.count("create") == 1
 
 
 def test_karmada_dispatcher_delete_job_removes_job_and_policy():
@@ -267,13 +459,13 @@ def test_karmada_dispatcher_delete_job_tolerates_already_gone():
     KarmadaJobDispatcher()._delete_job_with(batch, custom, spec)  # must not raise
 
 
-def test_karmada_job_manifest_reused_unchanged_from_p1():
+async def test_karmada_job_manifest_reused_unchanged_from_p1():
     # KarmadaJobDispatcher must apply the *same* Job manifest P1 builds --
     # topology is a dispatch-time concern, not a manifest-shape concern.
     spec = _spec(topology="multi", member_cluster="active-fed-member1")
     batch = FakeBatchApi()
     custom = FakeCustomObjectsApi()
-    KarmadaJobDispatcher()._ensure_job_with(batch, custom, spec)
+    await KarmadaJobDispatcher()._ensure_job_with(batch, custom, spec)
     # The fake doesn't capture the body directly above; assert indirectly via
     # build_job_manifest's own backoffLimit/restartPolicy invariants, which
     # this dispatcher must not alter.

@@ -561,7 +561,7 @@ async def _launch_and_watch_pod_multi(spec: WorkerSpec) -> WorkerResult:
     not_before = datetime.now(timezone.utc)
 
     dispatcher = dispatcher_for(spec)
-    name = dispatcher.ensure_job(spec)
+    name = await dispatcher.ensure_job(spec)
     minio_client = _minio_client_for(spec)
 
     try:

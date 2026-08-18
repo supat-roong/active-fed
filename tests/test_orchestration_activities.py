@@ -416,7 +416,11 @@ class FakeDispatcher:
         self.ensure_calls: list[int] = []
         self.delete_calls: list[int] = []
 
-    def ensure_job(self, spec):
+    async def ensure_job(self, spec):
+        # async to match JobDispatcher.ensure_job's Protocol (p3-task-3-review.md
+        # Finding 1 fix: KarmadaJobDispatcher._ensure_job_with needs to await a
+        # delete-and-recreate poll on 409, so the Protocol -- and its callers,
+        # launch_and_watch_pod included -- await ensure_job unconditionally).
         self.ensure_calls.append(spec.worker_id)
         return f"fake-job-w{spec.worker_id}"
 
