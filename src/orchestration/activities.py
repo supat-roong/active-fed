@@ -13,6 +13,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
 from typing import Any
 
 from temporalio import activity
@@ -25,6 +26,16 @@ log = logging.getLogger(__name__)
 POD_WATCH_TIMEOUT_S = 3600
 # How often to poll pod state and emit a heartbeat.
 POLL_INTERVAL_S = 5
+# Finding 3 (p3-task-4-review.md): tolerance for clock skew between this
+# process and the MinIO server's own clock -- last_modified is stamped by
+# MinIO when it receives the upload, not by the worker pod, so what matters
+# is skew between this process and the MinIO server, not the worker.
+# NTP-synced hosts in the same (or a nearby) cluster typically drift well
+# under a second; 5s is generous headroom for that jitter while still being
+# tiny next to how old a genuinely stale object from a previous, abandoned
+# attempt would be (at least one full training round -- minutes, not
+# seconds).
+_CLOCK_SKEW_TOLERANCE_S = 5.0
 
 # A Kubernetes object name segment: RFC-1123 lowercase alphanumerics and '-'.
 # kfp_run_id is truncated to 8 chars before use, so this only needs to accept
@@ -294,6 +305,26 @@ class WorkerJobFailed(Exception):
     """
 
 
+def _is_fresh(last_modified: datetime | None, not_before: datetime) -> bool:
+    """True if an object's last_modified is at/after not_before, within
+    _CLOCK_SKEW_TOLERANCE_S. Pure -- no I/O, directly unit-testable.
+
+    Finding 3 (p3-task-4-review.md): both datetimes must be timezone-aware
+    UTC -- minio.time.from_http_header (what populates a real stat_object
+    result's last_modified) always attaches tzinfo, and every caller of
+    wait_for_worker_artifact must pass an aware not_before (e.g.
+    datetime.now(timezone.utc)) for the same reason: comparing a naive and
+    an aware datetime raises TypeError, and this function does nothing to
+    paper over that mismatch -- it is the caller's job to never create it.
+    last_modified being None (no real stat_object result should ever lack
+    it, but a test double might) is treated as "can't prove freshness",
+    i.e. not fresh -- the same as the object not existing at all.
+    """
+    if last_modified is None:
+        return False
+    return last_modified >= not_before - timedelta(seconds=_CLOCK_SKEW_TOLERANCE_S)
+
+
 async def wait_for_worker_artifact(
     minio_client,
     bucket: str,
@@ -302,6 +333,7 @@ async def wait_for_worker_artifact(
     timeout_s: float,
     poll_s: float,
     failure_check: Callable[[], Awaitable[str | None]] | None = None,
+    not_before: datetime | None = None,
 ) -> bool:
     """Poll MinIO for the one object that means a multi-cluster worker is done.
 
@@ -343,6 +375,19 @@ async def wait_for_worker_artifact(
     contract this narrow (a plain callable returning str | None) is what
     lets this function stay ignorant of Karmada/dispatch.py and directly
     unit-testable with a bare lambda/async def.
+
+    not_before (Finding 3, p3-task-4-review.md): the completion key has no
+    run identifier, and run_pipeline.py's --bucket is documented as a resume
+    mechanism, so a resumed round can find a *previous*, abandoned attempt's
+    metrics object already sitting at this same key. When not_before is
+    given, an object whose last_modified predates it (beyond
+    _CLOCK_SKEW_TOLERANCE_S) is treated as though it weren't there at all --
+    it never satisfies the wait. Pass the activity's own wall-clock
+    timestamp captured before dispatch; ordinary datetime.now() is fine here
+    because this is activity code, not workflow code (only *workflow* code
+    must be deterministic for Temporal's replay). Left as None (the
+    default), no freshness check is performed, matching every pre-Finding-3
+    caller.
     """
     from minio.error import S3Error
 
@@ -350,8 +395,14 @@ async def wait_for_worker_artifact(
     waited = 0.0
     while waited < timeout_s:
         try:
-            minio_client.stat_object(bucket, key)
-            return True
+            stat = minio_client.stat_object(bucket, key)
+            if not_before is None or _is_fresh(stat.last_modified, not_before):
+                return True
+            log.warning(
+                f"{key} exists but predates this attempt (likely a stale artifact "
+                f"from an earlier, abandoned attempt at this round/worker) -- "
+                f"ignoring it and continuing to poll"
+            )
         except S3Error as e:
             if e.code not in ("NoSuchKey", "NoSuchObject"):
                 log.warning(f"transient MinIO error polling for {key}: {e}")
@@ -471,8 +522,22 @@ async def _launch_and_watch_pod_multi(spec: WorkerSpec) -> WorkerResult:
     above for the single-topology path. Whatever wait_for_worker_artifact
     raises (timeout or otherwise) is what drives the outcome; the Karmada
     lookup only adds context to the message.
+
+    Finding 3 (p3-task-4-review.md): not_before is captured here, before
+    dispatch, using ordinary wall-clock time -- this is activity code, which
+    Temporal does not replay, so datetime.now() is safe (only *workflow*
+    code must be deterministic). Capturing it before ensure_job rather than
+    after means any object already sitting in MinIO at this round/worker's
+    key -- left over from an earlier, abandoned attempt reached via
+    run_pipeline.py's --bucket resume path -- is unambiguously older than
+    this attempt's cutoff, so wait_for_worker_artifact can never mistake it
+    for this attempt's own completion.
     """
+    from datetime import timezone
+
     from src.orchestration.dispatch import dispatcher_for
+
+    not_before = datetime.now(timezone.utc)
 
     dispatcher = dispatcher_for(spec)
     name = dispatcher.ensure_job(spec)
@@ -487,6 +552,7 @@ async def _launch_and_watch_pod_multi(spec: WorkerSpec) -> WorkerResult:
             timeout_s=POD_WATCH_TIMEOUT_S,
             poll_s=POLL_INTERVAL_S,
             failure_check=lambda: _karmada_terminal_failure(spec, name),
+            not_before=not_before,
         )
     except Exception as e:
         reason = await _karmada_failure_reason(spec, name)

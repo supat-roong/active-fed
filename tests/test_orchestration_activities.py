@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -424,10 +425,18 @@ class FakeDispatcher:
 
 
 class FakeMinioClientForActivities:
-    """Presence-scripted stand-in for the multi-topology minio client seam."""
+    """Presence-scripted stand-in for the multi-topology minio client seam.
 
-    def __init__(self, present: bool):
+    last_modified defaults to "now" (matching a real object that just
+    landed); pass an explicit value to simulate a stale artifact left over
+    from a previous attempt (Finding 3, p3-task-4-review.md).
+    """
+
+    def __init__(self, present: bool, last_modified: datetime | None = None):
         self.present = present
+        self.last_modified = last_modified if last_modified is not None else datetime.now(
+            timezone.utc
+        )
         self.calls = 0
 
     def stat_object(self, bucket, key):
@@ -435,7 +444,7 @@ class FakeMinioClientForActivities:
 
         self.calls += 1
         if self.present:
-            return SimpleNamespace(object_name=key)
+            return SimpleNamespace(object_name=key, last_modified=self.last_modified)
         raise S3Error(
             response=None, code="NoSuchKey", message="nope", resource=f"/{bucket}/{key}",
             request_id="r", host_id="h",
@@ -656,3 +665,47 @@ async def test_launch_and_watch_pod_multi_topology_fast_fails_on_terminal_karmad
     # The whole point of Finding 2: nowhere near the 5s POD_WATCH_TIMEOUT_S,
     # let alone the real 3600s default.
     assert elapsed < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Finding 3 (p3-task-4-review.md): the reviewer's own repro, at the
+# launch_and_watch_pod level -- pre-seed a stale metrics object (as if left
+# over from a previous, abandoned attempt at this same round/worker) *before*
+# this attempt's Job is even created. Before the fix, wait_for_worker_artifact
+# returned True on the very first poll; after it, a stale object must never
+# satisfy the wait for a fresh attempt.
+# ---------------------------------------------------------------------------
+
+
+async def test_launch_and_watch_pod_multi_topology_ignores_a_preexisting_stale_artifact(
+    monkeypatch,
+):
+    import src.orchestration.activities as activities_module
+    import src.orchestration.dispatch as dispatch_module
+    from src.orchestration.activities import WorkerJobFailed
+
+    _forbid_k8s_batch_and_core(monkeypatch)
+    monkeypatch.setattr(activities_module, "POD_WATCH_TIMEOUT_S", 0.03)
+    monkeypatch.setattr(activities_module, "POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(activities_module.activity, "heartbeat", lambda *a, **k: None)
+
+    fake_dispatcher = FakeDispatcher()
+    monkeypatch.setattr(dispatch_module, "dispatcher_for", lambda spec: fake_dispatcher)
+    # The object is already there, stamped an hour before this activity even
+    # runs -- exactly the reviewer's repro: pre-seeded before the Job exists.
+    stale_artifact = FakeMinioClientForActivities(
+        present=True, last_modified=datetime.now(timezone.utc) - timedelta(hours=1)
+    )
+    monkeypatch.setattr(activities_module, "_minio_client_for", lambda spec: stale_artifact)
+    monkeypatch.setattr(
+        dispatch_module, "_karmada_clients",
+        lambda: (_ for _ in ()).throw(RuntimeError("karmada apiserver unreachable")),
+    )
+
+    with pytest.raises(WorkerJobFailed):
+        await launch_and_watch_pod(_multi_spec())
+
+    # It must have actually kept polling (and thus rejected the stale
+    # object), not succeeded on the very first call the way the pre-fix
+    # code did.
+    assert stale_artifact.calls > 1

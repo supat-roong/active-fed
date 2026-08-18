@@ -14,6 +14,7 @@ metrics key may ever be read as completion -- see
 test_does_not_treat_the_weights_object_alone_as_completion below.
 """
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -41,15 +42,23 @@ class FakeMinioClient:
     - `keys`: object keys considered "present", but only once the call count
       reaches `present_from_call` (default: present from the very first
       call) -- lets a test simulate an object landing after N polls.
-    - `error_calls`: {call_number: S3Error code} to raise instead of the
-      normal present/absent check on that specific call, for scripting
-      transient (non-"not found") errors.
+    - `error_calls`: {call_number: S3Error code | Exception} to raise instead
+      of the normal present/absent check on that specific call. A str value
+      is treated as an S3Error code (transient, non-"not found" errors); an
+      Exception instance is raised as-is, for scripting connection-level
+      errors (Finding 4) that never reach the S3Error layer at all.
+    - `last_modified`: {key: datetime} overriding the default (now, UTC) a
+      present object reports as its last_modified -- lets a test plant an
+      object that predates a given `not_before` cutoff (Finding 3).
     """
 
-    def __init__(self, keys=frozenset(), present_from_call=1, error_calls=None):
+    def __init__(
+        self, keys=frozenset(), present_from_call=1, error_calls=None, last_modified=None
+    ):
         self.keys = set(keys)
         self.present_from_call = present_from_call
         self.error_calls = dict(error_calls or {})
+        self.last_modified = dict(last_modified or {})
         self.calls = 0
         self.queried_keys: list[str] = []
 
@@ -57,9 +66,11 @@ class FakeMinioClient:
         self.calls += 1
         self.queried_keys.append(key)
         if self.calls in self.error_calls:
-            raise _s3_error(self.error_calls[self.calls])
+            scripted = self.error_calls[self.calls]
+            raise _s3_error(scripted) if isinstance(scripted, str) else scripted
         if key in self.keys and self.calls >= self.present_from_call:
-            return SimpleNamespace(object_name=key, bucket_name=bucket)
+            lm = self.last_modified.get(key, datetime.now(timezone.utc))
+            return SimpleNamespace(object_name=key, bucket_name=bucket, last_modified=lm)
         raise _s3_error("NoSuchKey")
 
 
@@ -223,6 +234,85 @@ async def test_absent_or_lagging_failure_check_never_short_circuits_the_wait(mon
 async def test_failure_check_is_optional_and_defaults_to_never_firing(monkeypatch):
     # Backward compatibility: every test above (and every pre-Finding-2
     # caller) invokes wait_for_worker_artifact without failure_check at all.
+    _patch_heartbeat(monkeypatch)
+    client = FakeMinioClient(keys={METRICS_KEY})
+
+    result = await wait_for_worker_artifact(
+        client, BUCKET, FL_ROUND, WORKER_ID, timeout_s=5, poll_s=0.01
+    )
+
+    assert result is True
+
+
+# ---------------------------------------------------------------------------
+# Finding 3 (p3-task-4-review.md): the completion key
+# (round_{fl_round}/workers/worker_{worker_id}_metrics.json) has no run
+# identifier, so a round resumed via run_pipeline.py's --bucket can find a
+# *previous*, abandoned attempt's metrics object and report a brand-new Job
+# as instantly succeeded. not_before is the fix: an object whose
+# last_modified predates it (beyond a small clock-skew tolerance) is treated
+# as if it weren't there. This is the reviewer's own repro
+# (pre-seed the object before the Job is created; the wait returned True
+# immediately) turned into a real test.
+# ---------------------------------------------------------------------------
+
+
+async def test_ignores_a_stale_artifact_pre_seeded_before_this_attempt(monkeypatch):
+    # THE repro: the metrics object already exists -- e.g. left over from a
+    # previous, abandoned attempt at this same round/worker -- *before* this
+    # attempt's Job is even created. not_before is captured at that point (in
+    # production, right before dispatch). A stale object must never satisfy
+    # the wait; it must behave exactly as if the key were absent.
+    _patch_heartbeat(monkeypatch)
+    stale_time = datetime.now(timezone.utc) - timedelta(hours=1)
+    client = FakeMinioClient(keys={METRICS_KEY}, last_modified={METRICS_KEY: stale_time})
+    not_before = datetime.now(timezone.utc)
+
+    with pytest.raises(TimeoutError):
+        await wait_for_worker_artifact(
+            client, BUCKET, FL_ROUND, WORKER_ID, timeout_s=0.03, poll_s=0.01,
+            not_before=not_before,
+        )
+
+    # It must actually have been polling for the key the whole time, not
+    # failing for some unrelated reason.
+    assert client.calls > 0
+
+
+async def test_accepts_a_fresh_artifact_at_or_after_not_before(monkeypatch):
+    _patch_heartbeat(monkeypatch)
+    not_before = datetime.now(timezone.utc)
+    fresh_time = not_before + timedelta(seconds=1)
+    client = FakeMinioClient(keys={METRICS_KEY}, last_modified={METRICS_KEY: fresh_time})
+
+    result = await wait_for_worker_artifact(
+        client, BUCKET, FL_ROUND, WORKER_ID, timeout_s=5, poll_s=0.01, not_before=not_before,
+    )
+
+    assert result is True
+
+
+async def test_accepts_an_artifact_within_clock_skew_tolerance(monkeypatch):
+    # A tiny bit *before* not_before must still count as fresh -- this
+    # process's clock and the MinIO server's clock are two different
+    # machines, and an exact >= comparison would be one NTP hiccup away from
+    # rejecting a perfectly legitimate, brand-new object.
+    _patch_heartbeat(monkeypatch)
+    not_before = datetime.now(timezone.utc)
+    barely_before = not_before - timedelta(seconds=1)
+    client = FakeMinioClient(keys={METRICS_KEY}, last_modified={METRICS_KEY: barely_before})
+
+    result = await wait_for_worker_artifact(
+        client, BUCKET, FL_ROUND, WORKER_ID, timeout_s=5, poll_s=0.01, not_before=not_before,
+    )
+
+    assert result is True
+
+
+async def test_not_before_is_optional_and_defaults_to_no_freshness_check(monkeypatch):
+    # Backward compatibility: every pre-Finding-3 caller (and every test
+    # above that doesn't pass not_before) never provided a last_modified at
+    # all in some fakes -- the freshness check must be entirely skippable.
     _patch_heartbeat(monkeypatch)
     client = FakeMinioClient(keys={METRICS_KEY})
 
