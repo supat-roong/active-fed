@@ -1,5 +1,5 @@
 .PHONY: install install-dev test lint fmt type-check clean build-images \
-        local-setup local-teardown compile-pipeline mlflow-ui
+        local-setup local-teardown multi-setup multi-teardown compile-pipeline mlflow-ui
 
 # ---- Deps ----
 install:
@@ -33,6 +33,15 @@ local-setup:
 local-teardown:
 	git submodule update --init --recursive
 	bash setup/teardown_local.sh
+
+# ---- Multi-cluster (host + Karmada members) ----
+multi-setup:
+	git submodule update --init --recursive
+	bash setup/install_multi.sh
+
+multi-teardown:
+	git submodule update --init --recursive
+	bash setup/teardown_multi.sh
 
 # ---- Docker ----
 build-images:

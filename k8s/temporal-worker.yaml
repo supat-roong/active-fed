@@ -51,6 +51,22 @@ spec:
         app: active-fl-temporal-worker
     spec:
       serviceAccountName: temporal-worker
+      # P3: the Karmada apiserver kubeconfig, mounted so this worker can
+      # reach the Karmada control plane and dispatch topology='multi' Jobs
+      # to member clusters (see src/orchestration/dispatch.py's
+      # _karmada_clients, which reads FED_KARMADA_CONFIG below as a file
+      # path). `optional: true` is deliberate: the single topology never
+      # creates this Secret (setup/install_local.sh doesn't; only
+      # setup/install_multi.sh does), and this one Deployment manifest is
+      # shared by both topologies. Without `optional: true`, a missing
+      # Secret would leave this pod stuck in ContainerCreating forever --
+      # exactly the single-topology regression the "must behave exactly as
+      # today" constraint forbids.
+      volumes:
+        - name: karmada-kubeconfig
+          secret:
+            secretName: karmada-kubeconfig
+            optional: true
       containers:
         - name: worker
           image: active-fed-aggregator:v1
@@ -61,6 +77,14 @@ spec:
               value: "temporal-frontend.active-fed.svc.cluster.local:7233"
             - name: TEMPORAL_NAMESPACE
               value: "default"
+            # Read by dispatch.py's _karmada_clients only when a worker's
+            # topology is 'multi'; unused (and harmless) for topology='single'.
+            - name: FED_KARMADA_CONFIG
+              value: "/etc/karmada/karmada-apiserver.config"
+          volumeMounts:
+            - name: karmada-kubeconfig
+              mountPath: /etc/karmada
+              readOnly: true
           resources:
             requests:
               memory: "256Mi"
