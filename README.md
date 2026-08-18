@@ -210,9 +210,10 @@ make local-setup
 make run-pipeline
 
 # Open UIs (after port-forward):
-#   Kubeflow: http://localhost:8080
-#   MLflow:   http://localhost:5050
-#   MinIO:    http://localhost:9001
+#   Kubeflow:             http://localhost:8080
+#   MLflow:               http://localhost:5050
+#   MinIO:                http://localhost:9001
+#   Kubernetes Dashboard: https://localhost:8443
 
 # 3. Fetch K8s MLflow results + generate plots
 make compare-k8s
@@ -223,18 +224,46 @@ make local-teardown
 
 ---
 
-## Observability: Three Surfaces
+## Observability: Four Surfaces
 
-Running the K8s pipeline (`make run-pipeline`) gives you three UIs, each answering a
+Running the K8s pipeline (`make run-pipeline`) gives you four UIs, each answering a
 different question. They never overlap in scope — KFP sequences *rounds*, Temporal manages
-the worker *fleet inside* a round, and MLflow tracks *ML metrics* — so there's no ambiguity
-about which one to open for a given question.
+the worker *fleet inside* a round, MLflow tracks *ML metrics*, and the Kubernetes Dashboard
+shows *pod-level* health — so there's no ambiguity about which one to open for a given
+question. In multi-cluster mode a fifth surface, the Karmada Dashboard, adds propagation
+state and member cluster health.
 
 | Surface | URL | Answers |
 |---|---|---|
-| **Kubeflow Pipelines** | http://localhost:8080 | Round DAG (`train → aggregate → evaluate`), node logs, artifact lineage |
-| **Temporal Web** | http://localhost:8233 | Which worker is running and for how long, retry counts, live per-worker progress |
-| **MLflow** | http://localhost:5050 | Reward curves, client scores, acceptance rate, active-data usage |
+| Kubeflow Pipelines | http://localhost:8080 | Round DAG, node logs, artifact lineage |
+| Temporal | http://localhost:8233 | Which worker failed and why; retry counts; live progress |
+| MLflow | http://localhost:5050 | Reward curves, client scores, acceptance rate, active-data usage |
+| Kubernetes Dashboard | http://localhost:8443 | Pod phase, restarts, events, exec |
+| Karmada Dashboard *(multi only)* | http://localhost:32000 | Propagation state, member cluster health |
+
+Every round's MLflow run also carries five cross-link tags — `kfp_run_id`, `kfp_run_url`,
+`temporal_workflow_id`, `temporal_workflow_url`, `topology` — set by `log_run_context()`
+(`src/tracking/mlflow_logger.py`) inside `evaluate_global`. They turn the first three
+surfaces from independent islands into one connected trail.
+
+### Start from a bad reward curve
+
+A concrete walkthrough of the trail above, for the question that comes up most often — "this
+reward curve looks wrong, which worker failed?":
+
+1. Open the suspicious round's run in MLflow and follow its `temporal_workflow_url` tag.
+2. That opens the round's `TrainRoundWorkflow` in Temporal, fanned out into one
+   `WorkerWorkflow` per worker — find the one that failed.
+3. Read that `WorkerWorkflow`'s failure reason directly (see
+   [Reading per-worker progress in Temporal](#reading-per-worker-progress-in-temporal) below
+   for what that looks like in the UI).
+4. Follow the same MLflow run's `kfp_run_url` tag back to that round's KFP DAG for node logs
+   and artifact lineage.
+
+Reach for the Kubernetes Dashboard (`https://localhost:8443`) instead when the question is
+about the *pod* rather than the *workflow* — phase, restarts, events, or an interactive
+`exec`. Get a login token with `fed_dashboard_token active-fed dashboard-admin` (from
+`vendor/fed-infra/lib/dashboard.sh`; see that repo's README for the full function contract).
 
 ### Reading per-worker progress in Temporal
 
