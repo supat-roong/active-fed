@@ -121,6 +121,17 @@ class TrainRoundWorkflow:
     async def run(self, spec: RoundSpec) -> RoundReport:
         parent_id = workflow.info().workflow_id
 
+        # P4 Task 2: carry kfp_run_id in the workflow memo so the Temporal UI
+        # can reverse-link back to the KFP round (KFP -> Temporal is already
+        # covered by the URL train_workers prints; this is the other
+        # direction) without opening the workflow's full event history.
+        # Deterministic and replay-safe: spec is the workflow's own input,
+        # and upsert_memo is a workflow command, not I/O. Skipped when empty
+        # for the same reason log_run_context skips empty ids -- an empty
+        # memo value is worse than no memo entry.
+        if spec.kfp_run_id:
+            workflow.upsert_memo({"kfp_run_id": spec.kfp_run_id})
+
         async def _one(worker_id: int) -> WorkerResult:
             self._statuses[worker_id] = WorkerStatus(worker_id=worker_id, phase="Running")
             try:

@@ -351,6 +351,34 @@ async def test_real_activity_failure_reaches_round_report_with_useful_message(mo
     assert "MemoryError" in failed.failure_reason
 
 
+# ---------------------------------------------------------------------------
+# P4 Task 2: kfp_run_id carried in the workflow memo, so the Temporal UI can
+# reverse-link back to the KFP round without opening the workflow's history.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_train_round_workflow_memo_carries_kfp_run_id():
+    @activity.defn(name="launch_and_watch_pod")
+    async def launch(spec: WorkerSpec) -> WorkerResult:
+        return _ok(spec)
+
+    @activity.defn(name="cleanup_worker_job")
+    async def cleanup(spec: WorkerSpec) -> None:
+        return None
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE,
+            workflows=[TrainRoundWorkflow, WorkerWorkflow], activities=[launch, cleanup],
+        ):
+            handle = await env.client.start_workflow(
+                TrainRoundWorkflow.run, _round_spec(),
+                id=f"t-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            await handle.result()
+            desc = await handle.describe()
+    assert await desc.memo_value("kfp_run_id") == "abcdef1234"
+
+
 @pytest.mark.asyncio
 async def test_real_activity_failure_below_quorum_still_fails_the_round(monkeypatch):
     from temporalio.client import WorkflowFailureError
