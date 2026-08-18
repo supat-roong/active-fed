@@ -31,6 +31,21 @@ DEFAULT_MEMBERS = 0
 # by the same name. Enforced by
 # test_member_prefix_matches_the_multi_infra_contract.
 DEFAULT_MEMBER_PREFIX = "active-fed-member"
+# P3 multi-endpoints fix: fallback defaults for orchestration.minio_nodeport/
+# mlflow_nodeport when config/k8s-multi.yaml doesn't set them (config/k8s.yaml
+# never sets them at all -- topology="single" doesn't read them). Must equal
+# FED_NODEPORT_MINIO_API/FED_NODEPORT_MLFLOW in infra.env.multi: for
+# topology="multi", the Temporal worker rewrites each WorkerSpec's
+# minio_endpoint/mlflow_tracking_uri to <host-node-ip>:<nodeport> at dispatch
+# time (src/orchestration/activities.py's _rewrite_endpoints_for_multi),
+# since a Karmada member cluster cannot resolve the host's in-cluster DNS
+# names. Enforced by test_nodeports_match_the_multi_infra_contract /
+# test_multi_config_nodeports_agree_with_the_multi_infra_contract, and pinned
+# against active_fl_pipeline's own dsl parameter defaults by
+# test_nodeport_default_layers_agree -- the same three-layer agreement
+# topology/members/member_prefix above already guard.
+DEFAULT_MINIO_NODEPORT = 30900
+DEFAULT_MLFLOW_NODEPORT = 30500
 
 
 def compute_start_round(minio_client, bucket: str) -> int:
@@ -161,6 +176,8 @@ def main():
     topology = orch.get("topology", DEFAULT_TOPOLOGY)
     members = orch.get("members", DEFAULT_MEMBERS)
     member_prefix = orch.get("member_prefix", DEFAULT_MEMBER_PREFIX)
+    minio_nodeport = orch.get("minio_nodeport", DEFAULT_MINIO_NODEPORT)
+    mlflow_nodeport = orch.get("mlflow_nodeport", DEFAULT_MLFLOW_NODEPORT)
     seed = exp.get("seed", 42)
 
     combos = cfg.get("combinations", [{"weight_mode": "active", "active_data_mode": "bc"}])
@@ -282,6 +299,8 @@ def main():
             "topology": topology,
             "members": members,
             "member_prefix": member_prefix,
+            "minio_nodeport": minio_nodeport,
+            "mlflow_nodeport": mlflow_nodeport,
             "run_uid": run_uid,
             "seed": seed,
             # P2 review fix wave, Finding 1: start_round is NOT passed here.

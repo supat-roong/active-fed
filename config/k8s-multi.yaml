@@ -48,6 +48,22 @@ orchestration:
   # cluster that does not exist, which Karmada matches silently to
   # nothing rather than reporting an error.
   member_prefix: active-fed-member
+  # NodePorts exposing the host cluster's MinIO/MLflow Services. Under
+  # topology="multi", worker pods land on a Karmada *member* cluster -- a
+  # separate Kubernetes cluster with its own DNS -- so they cannot resolve
+  # minio_endpoint/mlflow_tracking_uri's in-cluster DNS names, which belong
+  # to the host cluster. The Temporal worker (running on the host cluster)
+  # rewrites both endpoints to <host-node-ip>:<nodeport> at dispatch time
+  # (src/orchestration/activities.py's _rewrite_endpoints_for_multi),
+  # resolving the node IP dynamically since it is not stable across a
+  # kind/VM restart. Must equal FED_NODEPORT_MINIO_API/FED_NODEPORT_MLFLOW
+  # in infra.env.multi -- fed-infra exposes these NodePorts on the host
+  # cluster, and a mismatch means the rewritten endpoint points at a
+  # NodePort nothing (or the wrong thing) is listening on. Enforced by
+  # test_nodeports_match_the_multi_infra_contract /
+  # test_multi_config_nodeports_agree_with_the_multi_infra_contract.
+  minio_nodeport: 30900
+  mlflow_nodeport: 30500
 
 # --- Aggregation Params ---
 aggregation:

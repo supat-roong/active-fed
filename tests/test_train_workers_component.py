@@ -54,7 +54,8 @@ def _base_kwargs(worker_report) -> dict:
         mlflow_experiment_name="exp", minio_endpoint="minio:9000",
         minio_access_key="a", minio_secret_key="b", minio_bucket="bkt",
         worker_image="img:v1", topology="single", members=0,
-        member_prefix="active-fed-member", worker_report=worker_report,
+        member_prefix="active-fed-member", minio_nodeport=30900,
+        mlflow_nodeport=30500, worker_report=worker_report,
     )
 
 

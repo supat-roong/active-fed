@@ -302,3 +302,111 @@ def test_multi_config_agrees_with_the_multi_infra_contract():
         "of member clusters than fed-infra creates"
     )
     assert orch["member_prefix"] == env["FED_MEMBER_PREFIX"]
+
+
+# ---------------------------------------------------------------------------
+# P3 multi-endpoints fix: minio_nodeport/mlflow_nodeport. Threaded exactly the
+# way topology/members/member_prefix already are (config/k8s-multi.yaml ->
+# run_pipeline.py's own fallback -> this pipeline's own dsl parameter
+# default), and matching FED_NODEPORT_MINIO_API/FED_NODEPORT_MLFLOW in
+# infra.env.multi -- the same "silently decorative parameter" / "config that
+# can silently drift from the infra it's paired with" traps
+# topology/members/member_prefix already guard against, above. Only present
+# in config/k8s-multi.yaml (not config/k8s.yaml): topology='single' never
+# reads these values at all (activities.py's endpoint rewrite only runs for
+# topology='multi'), so there's no equivalent single-profile contract to keep
+# in sync.
+# ---------------------------------------------------------------------------
+
+
+def test_compiled_pipeline_carries_nodeports(tmp_path):
+    text = _compile(tmp_path)
+    spec = yaml.safe_load(text)
+    params = spec["root"]["inputDefinitions"]["parameters"]
+    assert "minio_nodeport" in params, sorted(params)
+    assert "mlflow_nodeport" in params, sorted(params)
+
+
+def test_nodeport_default_layers_agree(tmp_path):
+    """minio_nodeport/mlflow_nodeport must agree across all three layers, the
+    same as topology/members above (test_topology_and_members_default_layers_agree).
+
+    Unlike topology/members, config/k8s.yaml has no orchestration.minio_nodeport/
+    mlflow_nodeport at all -- topology='single' never reads them, so
+    config/k8s-multi.yaml is layer 1 here instead.
+    """
+    from src.pipelines.run_pipeline import DEFAULT_MINIO_NODEPORT, DEFAULT_MLFLOW_NODEPORT
+
+    # Layer 1: config/k8s-multi.yaml -- the value actually authored there today.
+    with open(_REPO_ROOT / "config" / "k8s-multi.yaml") as f:
+        cfg = yaml.safe_load(f)
+    orch = cfg.get("orchestration", {})
+    assert orch.get("minio_nodeport", DEFAULT_MINIO_NODEPORT) == DEFAULT_MINIO_NODEPORT
+    assert orch.get("mlflow_nodeport", DEFAULT_MLFLOW_NODEPORT) == DEFAULT_MLFLOW_NODEPORT
+
+    # Layer 3: active_fl_pipeline's own dsl parameter default -- what applies
+    # to direct compilation (`make compile-pipeline`), when run_pipeline.py
+    # isn't the caller.
+    spec = yaml.safe_load(_compile(tmp_path))
+    params = spec["root"]["inputDefinitions"]["parameters"]
+    assert params["minio_nodeport"]["defaultValue"] == DEFAULT_MINIO_NODEPORT, (
+        "active_fl_pipeline's minio_nodeport default disagrees with "
+        "run_pipeline.py's DEFAULT_MINIO_NODEPORT -- exactly the "
+        "layer-disagreement Finding 1 warned about"
+    )
+    assert params["mlflow_nodeport"]["defaultValue"] == DEFAULT_MLFLOW_NODEPORT, (
+        "active_fl_pipeline's mlflow_nodeport default disagrees with "
+        "run_pipeline.py's DEFAULT_MLFLOW_NODEPORT -- exactly the "
+        "layer-disagreement Finding 1 warned about"
+    )
+
+
+def test_nodeports_match_the_multi_infra_contract():
+    """run_pipeline.py's fallback defaults must match FED_NODEPORT_MINIO_API/
+    FED_NODEPORT_MLFLOW in infra.env.multi -- the same coupling
+    test_member_prefix_matches_the_multi_infra_contract guards for
+    member_prefix: fed-infra exposes these NodePorts, activities.py's
+    endpoint rewrite addresses them.
+    """
+    from src.pipelines.run_pipeline import DEFAULT_MINIO_NODEPORT, DEFAULT_MLFLOW_NODEPORT
+
+    env = {}
+    with open(_REPO_ROOT / "infra.env.multi") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k] = v
+    assert DEFAULT_MINIO_NODEPORT == int(env["FED_NODEPORT_MINIO_API"])
+    assert DEFAULT_MLFLOW_NODEPORT == int(env["FED_NODEPORT_MLFLOW"])
+
+
+def test_multi_config_nodeports_agree_with_the_multi_infra_contract():
+    """config/k8s-multi.yaml and infra.env.multi must describe the same
+    NodePorts -- the same coupling
+    test_multi_config_agrees_with_the_multi_infra_contract guards for
+    members/member_prefix. A mismatch is silent: activities.py would rewrite
+    worker endpoints onto a NodePort infra.env.multi never actually exposed
+    on the host cluster, so the worker Job would connect (or fail to
+    connect) to whatever happens to be listening on the wrong port.
+    """
+    with open(_REPO_ROOT / "config" / "k8s-multi.yaml") as f:
+        cfg = yaml.safe_load(f)
+    orch = cfg["orchestration"]
+
+    env = {}
+    with open(_REPO_ROOT / "infra.env.multi") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k] = v
+
+    assert orch["minio_nodeport"] == int(env["FED_NODEPORT_MINIO_API"]), (
+        "config/k8s-multi.yaml's minio_nodeport disagrees with infra.env.multi's "
+        "FED_NODEPORT_MINIO_API"
+    )
+    assert orch["mlflow_nodeport"] == int(env["FED_NODEPORT_MLFLOW"]), (
+        "config/k8s-multi.yaml's mlflow_nodeport disagrees with infra.env.multi's "
+        "FED_NODEPORT_MLFLOW"
+    )
