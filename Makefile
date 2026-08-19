@@ -1,5 +1,6 @@
 .PHONY: install install-dev test lint fmt type-check clean build-images \
-        local-setup local-teardown multi-setup multi-teardown compile-pipeline mlflow-ui
+        local-setup local-teardown multi-setup multi-teardown compile-pipeline mlflow-ui \
+        ci contracts
 
 # ---- Deps ----
 install:
@@ -24,6 +25,24 @@ fmt:
 
 type-check:
 	uv run mypy src/
+
+# ---- CI ----
+# Tier 1: exactly what CI runs per PR.
+ci: lint test compile-pipeline
+
+# Tier 2: dry-run this consumer's real contracts against the pinned
+# vendor/fed-infra. Catches a submodule bump that breaks our contracts before
+# it reaches a cluster -- the class of defect that cost the most time in P3
+# (a karmada component that gated nothing, a renamed port variable, member_prefix
+# drifting from FED_MEMBER_PREFIX).
+contracts:
+	@set -e; for env in infra.env infra.env.multi; do \
+		echo "=== dry-run $$env ==="; \
+		out=$$(mktemp -d); \
+		bash vendor/fed-infra/bin/fed-infra-up --env "$$env" --dry-run --render-dir "$$out"; \
+		test -n "$$(ls -A $$out)" || { echo "FAIL: $$env rendered nothing"; exit 1; }; \
+		rm -rf "$$out"; \
+	done
 
 # ---- Local k8s ----
 local-setup:
