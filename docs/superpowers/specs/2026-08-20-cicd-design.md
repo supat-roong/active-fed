@@ -57,7 +57,7 @@ Each tier runs where it can actually run; nothing claims coverage it does not ha
 | Tier | Where | When | Contents |
 |---|---|---|---|
 | 1 — Unit | GitHub-hosted | every PR | lint, unit tests, pipeline compile, image build |
-| 2 — Contract | GitHub-hosted | every PR | `fed-infra-up --dry-run` over every real contract; golden renders; config-agreement tests |
+| 2 — Contract | GitHub-hosted | every PR | `fed-infra-up --dry-run` over the contracts that repo owns; golden renders; config-agreement tests |
 | 3 — Smoke | GitHub-hosted | nightly | one real kind cluster: single-profile bring-up, then a second run proving idempotency |
 | 4 — Gate | developer machine | manual | full KFP/Temporal/MLflow/MinIO stack; multi-cluster Karmada topology |
 
@@ -69,8 +69,10 @@ mismatches rather than runtime failures: the `karmada`-component validation, the
 
 **Why Tier 4 stays out of CI.** A single-cluster stack consumed ~33 GB of Docker disk
 and 10 GB RAM locally; the multi-cluster gate needed three clusters and a VM grown to
-118 GB. GitHub-hosted runners provide 14 GB of disk. A nightly that thrashes is worse
-than an honest manual gate, because people learn to ignore it. Tier 4 is already
+118 GB. A GitHub-hosted runner offers roughly an order of magnitude less disk than that
+(commonly cited as 14 GB free, **unverified in this session** — the Tier 3 task must
+measure it on a real run and adjust, rather than trust this figure). A nightly that
+thrashes is worse than an honest manual gate, because people learn to ignore it. Tier 4 is already
 documented in `docs/superpowers/gates/`.
 
 ---
@@ -82,6 +84,10 @@ documented in `docs/superpowers/gates/`.
 Sparse-checkout the contracts rather than vendoring copies — a checked-in copy drifts,
 which is the exact failure this is meant to catch. A library change that breaks a
 consumer then fails in the repo that caused it, before any submodule bump.
+
+Concretely, "the contracts that repo owns" means: fed-infra dry-runs its three test
+fixtures (`consumer-a/b/c.env`); active-fed dry-runs `infra.env` and `infra.env.multi`;
+fed-twin dry-runs `infra.env` and `infra.env.multi`.
 
 **consumers → fed-infra**, every PR, in each consumer: dry-run that consumer's own
 contracts against the **pinned** submodule SHA, so a bad bump fails in the PR performing it.
