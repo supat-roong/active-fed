@@ -69,10 +69,21 @@ mismatches rather than runtime failures: the `karmada`-component validation, the
 
 **Why Tier 4 stays out of CI.** A single-cluster stack consumed ~33 GB of Docker disk
 and 10 GB RAM locally; the multi-cluster gate needed three clusters and a VM grown to
-118 GB. A GitHub-hosted runner offers roughly an order of magnitude less disk than that
-(commonly cited as 14 GB free, **unverified in this session** — the Tier 3 task must
-measure it on a real run and adjust, rather than trust this figure). A nightly that
-thrashes is worse than an honest manual gate, because people learn to ignore it. Tier 4 is already
+118 GB.
+
+**Measured, 2026-08-20 — this corrects the assumption this section was built on.** A
+GitHub-hosted `ubuntu-latest` runner reports `/dev/root 145G` with **87 GB available**
+before any reclamation (108 GB after). The figure carried here previously, ~14 GB, was
+wrong by an order of magnitude; it was flagged unverified for exactly that reason and the
+Tier 3 job's `df -h` steps are what settled it.
+
+The consequence is that the disk argument for keeping Tier 4 manual **does not hold**. A
+single-cluster stack used ~33 GB locally and would fit comfortably; even the
+three-cluster Karmada topology (~55 GB of volumes and images) is plausible. What remains
+true is the memory and time argument: the multi-cluster gate took roughly an hour of
+wall-clock and needed 10 GB of RAM, against a runner's 16 GB. Tier 4 therefore stays
+manual for now on *those* grounds, not on disk — and promoting some of it to a nightly is
+a live option worth its own decision rather than an assumption. Tier 4 is already
 documented in `docs/superpowers/gates/`.
 
 ---
