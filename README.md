@@ -328,6 +328,27 @@ Each round logs:
 
 ---
 
+## CI/CD
+
+Two GitHub Actions workflows cover validation and publishing:
+
+**CI** (`.github/workflows/ci.yml`) — runs on every push and PR to `main`, three parallel jobs:
+1. **Lint, test, compile** — `make ci` (ruff + pytest + pipeline compilation), i.e. exactly what you can run locally before pushing.
+2. **Contract dry-runs** — `make contracts`: renders both consumer contracts (`infra.env`, `infra.env.multi`) against the pinned `vendor/fed-infra` submodule, catching a submodule bump that breaks our contracts before it ever reaches a cluster.
+3. **Build images** — builds both Docker images (no push) with GHA layer caching.
+
+**Release** (`.github/workflows/release.yml`) — publishes the worker and aggregator images to GHCR:
+- On a **push to `main`**: waits for CI to finish and only publishes off a green run, tagging `main` and `sha-<short>`. A red `main` is never published.
+- On a **`v*` tag push**: publishes a semver-tagged image (e.g. `1.2.3`) and creates a GitHub Release with generated notes. No floating `latest` tag is ever produced.
+
+```bash
+# Run the same checks CI runs, locally
+make ci          # lint + test + compile-pipeline
+make contracts   # dry-run infra.env + infra.env.multi against pinned vendor/fed-infra
+```
+
+---
+
 ## Project Structure
 
 ```
@@ -365,6 +386,8 @@ make test-fast        run tests, skipping slow training tests
 make lint             ruff check src/ tests/
 make fmt              ruff format src/ tests/
 make type-check       mypy src/
+make ci               exactly what CI runs per PR: lint + test + compile-pipeline
+make contracts        dry-run infra.env + infra.env.multi against pinned vendor/fed-infra
 make run-experiments  run all combinations from config/local.yaml (parallel)
 make run-single       WEIGHT_MODE=X ACTIVE_DATA_MODE=Y  (single combo)
 make dry-run-worker   smoke-test worker entrypoint locally (no K8s)
