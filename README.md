@@ -2,7 +2,7 @@
 
 **Federated Learning with active learning**: This project explores combining active learning strategies with federated learning. Instead of naive Federated Averaging (FedAvg), the central server evaluates and selects updates using **Active Weight** and **Active Data** methods to improve the global model.
 
-The framework supports running experiments both **locally** (via parallel subprocesses) and remotely on **Kubernetes** (via Kubeflow Pipelines and PyTorchJobs).
+The framework supports running experiments both **locally** (via parallel subprocesses) and remotely on **Kubernetes** — Kubeflow Pipelines owns the round-level DAG, and Temporal launches and watches one Kubernetes Job per worker inside each round.
 
 ---
 
@@ -162,7 +162,7 @@ Outputs saved to `results/`:
 
 ## Use Case 2: Kubernetes / Kubeflow Pipeline (real distributed FL)
 
-Workers run as isolated pods (true process separation), weights and artifacts flow through MinIO, and metrics are tracked in a shared MLflow server. Kubeflow Pipelines orchestrates the DAG.
+Workers run as isolated pods (true process separation), weights and artifacts flow through MinIO, and metrics are tracked in a shared MLflow server. Kubeflow Pipelines orchestrates the round-level DAG; inside each round, Temporal fans out one durable `WorkerWorkflow` per worker, each launching and watching a plain Kubernetes Job. (There is no PyTorchJob in this path — the `pytorchjob` launcher was removed in Phase P2.)
 
 **When to use:** real federated scenario (workers on different machines/data), GPU training, production-scale runs, or when you need the full MLflow + artifact tracking pipeline.
 
@@ -173,15 +173,20 @@ graph TD
     classDef job fill:#e3f2fd,stroke:#1565c0
     classDef pod fill:#f3e5f5,stroke:#6a1b9a
     classDef store fill:#fff3e0,stroke:#e65100
-    
-    Train[train_workers<br><i>PyTorchJob: N worker pods train PPO</i>]:::job
+    classDef temporal fill:#e8f5e9,stroke:#2e7d32
+
+    Train[train_workers<br><i>thin Temporal client: starts one TrainRoundWorkflow</i>]:::job
+    Round[TrainRoundWorkflow<br><i>fans out one WorkerWorkflow per worker</i>]:::temporal
+    Jobs[Worker Kubernetes Jobs<br><i>one pod per worker trains PPO</i>]:::pod
     Agg[score_and_aggregate<br><i>Aggregator pod: eval probes, scoring, FedAvg + active data</i>]:::pod
     Eval[evaluate_global<br><i>Evaluation pod: global model eval</i>]:::pod
-    
+
     MinIO[(MinIO Storage)]:::store
     MLflow[(MLflow Server)]:::store
-    
-    Train -->|Δw_i| MinIO
+
+    Train --> Round
+    Round -->|launch_and_watch_pod| Jobs
+    Jobs -->|Δw_i| MinIO
     Train --> Agg
     MinIO -->|Fetch Δw_i| Agg
     Agg -->|Write W_new| MinIO
@@ -189,6 +194,8 @@ graph TD
     MinIO -->|Fetch W_new| Eval
     Eval -->|Log Metrics & Checkpoints| MLflow
 ```
+
+KFP still owns the round-level DAG and artifact lineage; Temporal owns the worker fleet *within* a round (retries, heartbeats, per-worker failure reasons — see [Observability](#observability-four-surfaces) below).
 
 ### What to see in Kubeflow UI
 - **Pipeline graph**: per-round DAG with `train → aggregate → evaluate` chain
