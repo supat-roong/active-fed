@@ -215,6 +215,9 @@ make local-setup
 
 # 2. Run pipeline (uses config/k8s.yaml)
 make run-pipeline
+# Flags (via ARGS): --config PATH, --kfp-host URL, --wait (block until runs
+# finish), --auto-download (fetch MLflow results after; implies --wait)
+make run-pipeline ARGS="--wait --auto-download"
 
 # Open UIs (after port-forward):
 #   Kubeflow:             http://localhost:8080
