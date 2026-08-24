@@ -229,6 +229,36 @@ make compare-k8s
 make local-teardown
 ```
 
+### Multi-cluster topology (Karmada)
+
+Setting `orchestration.topology: multi` propagates each worker Job via **Karmada** onto a
+separate member cluster instead of running the whole fleet on one cluster. Two file pairs
+drive the two topologies — `config/k8s.yaml` ↔ `infra.env` (single) and
+`config/k8s-multi.yaml` ↔ `infra.env.multi` (multi):
+
+- `infra.env.multi` tells `vendor/fed-infra` to create a **host cluster + 2 member clusters**
+  (`FED_MEMBER_COUNT`/`FED_MEMBER_PREFIX`) and adds the `karmada` + `karmada-dashboard`
+  components.
+- `config/k8s-multi.yaml` sets `topology: multi`, `members: 2`, and runs a single mode
+  combination — it exists to exercise cross-cluster propagation, not to compare strategies.
+- **Keep the pairs in sync**: `members` must equal `FED_MEMBER_COUNT` and `member_prefix`
+  must equal `FED_MEMBER_PREFIX`. A mismatch makes the PropagationPolicy name a cluster
+  that doesn't exist, which Karmada matches silently to nothing rather than erroring.
+
+```bash
+# Bootstrap host + member clusters (uses infra.env.multi)
+make multi-setup
+
+# Run the pipeline against the multi topology
+make run-pipeline ARGS="--config config/k8s-multi.yaml"
+
+# Propagation state & member cluster health
+# Karmada Dashboard: http://localhost:32000
+
+# Teardown
+make multi-teardown
+```
+
 ---
 
 ## Observability: Four Surfaces
@@ -400,8 +430,10 @@ make compile-pipeline compile Kubeflow pipeline → /tmp/active_fl_pipeline.yaml
 make run-pipeline     trigger the compiled pipeline locally
 make build-images     build Docker images
 make load-images      load into kind cluster
-make local-setup      bootstrap kind cluster
+make local-setup      bootstrap kind cluster (single topology, infra.env)
 make local-teardown   destroy kind cluster
+make multi-setup      bootstrap host + Karmada member clusters (infra.env.multi)
+make multi-teardown   destroy host + member clusters
 make clean            remove __pycache__
 make clean-results    remove results/ directory
 ```
