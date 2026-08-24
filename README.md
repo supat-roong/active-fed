@@ -391,7 +391,8 @@ src/
   tracking/       MLflow helpers
 config/
   local.yaml      Hyperparameters + combinations for local experiments
-  k8s.yaml        Hyperparameters for Kubeflow pipelines
+  k8s.yaml        Hyperparameters for Kubeflow pipelines (single topology)
+  k8s-multi.yaml  Multi-cluster variant (topology: multi, pairs with infra.env.multi)
 experiments/
   run_experiments.py  Local experiment orchestrator (parallel, auto-viz)
 analysis/
@@ -400,10 +401,15 @@ analysis/
 k8s/              Manifests: RBAC (worker Job + Temporal-worker access), Temporal worker Deployment
 docker/           Worker + aggregator Dockerfiles
 setup/            kind cluster bootstrap + teardown scripts (delegates to vendor/fed-infra)
+vendor/fed-infra  Git submodule: reusable kind/KFP/Temporal/MinIO/MLflow/Karmada infra
+infra.env         Consumer contract for vendor/fed-infra (single topology)
+infra.env.multi   Consumer contract for the multi topology (host + Karmada members)
+.github/workflows CI (lint/test/compile, contract dry-runs, image builds) + Release (GHCR)
+docs/superpowers/ Design specs, implementation plans, and review records
 run_pipeline.sh   Kubeflow pipeline trigger script
 tests/            Unit tests across all components
 results/          Experiment outputs (JSON + plots)
-mlruns/           Local MLflow tracking store
+mlruns/           Local MLflow tracking store (created on first local run, gitignored)
 ```
 
 ## Makefile Quick Reference
