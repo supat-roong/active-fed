@@ -202,6 +202,17 @@ KFP still owns the round-level DAG and artifact lineage; Temporal owns the worke
 - **Pod logs**: per-worker training progress, client scores, improvement values
 - **Artifacts**: aggregation report JSON (accepted/rejected clients with scores)
 
+### Infrastructure package
+
+Cluster bootstrap is handled by [fed-infra](https://github.com/supat-roong/fed-infra),
+a reusable Bash library vendored as a git submodule at `vendor/fed-infra` and driven
+by `infra.env` (single cluster) / `infra.env.multi` (multi cluster). It brings up the
+kind cluster(s) with Kubeflow Pipelines, the Kubeflow Training Operator, Temporal,
+MinIO, MLflow, and the Kubernetes Dashboard (plus Karmada and its dashboard in multi
+mode). See the fed-infra [README](https://github.com/supat-roong/fed-infra#readme)
+and [variable reference](https://github.com/supat-roong/fed-infra/blob/main/docs/variables.md)
+for details.
+
 ```bash
 # Prerequisites: kind, kubectl, helm, docker
 
